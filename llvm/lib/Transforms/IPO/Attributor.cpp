@@ -420,8 +420,14 @@ ChangeStatus AANoUnwindFunction::updateImpl(Attributor &A) {
       (unsigned)Instruction::Call,        (unsigned)Instruction::CleanupRet,
       (unsigned)Instruction::CatchSwitch, (unsigned)Instruction::Resume};
 
+  auto *LivenessAA = A.getAAFor<AAIsDead>(*this, F);
+
   for (unsigned Opcode : Opcodes) {
     for (Instruction *I : OpcodeInstMap[Opcode]) {
+      // Skip dead blocks.
+      if (LivenessAA && LivenessAA->isAssumedDead(I->getParent()))
+        continue;
+
       if (!I->mayThrow())
         continue;
 
@@ -546,11 +552,12 @@ public:
   /// Return an assumed unique return value if a single candidate is found. If
   /// there cannot be one, return a nullptr. If it is not clear yet, return the
   /// Optional::NoneType.
-  Optional<Value *> getAssumedUniqueReturnValue() const;
+  Optional<Value *> getAssumedUniqueReturnValue(const AAIsDead *LivenessAA) const;
 
   /// See AbstractState::checkForallReturnedValues(...).
-  bool
-  checkForallReturnedValues(std::function<bool(Value &)> &Pred) const override;
+  bool checkForallReturnedValues(
+      std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> &Pred)
+      const override;
 
   /// Pretty print the attribute similar to the IR representation.
   const std::string getAsStr() const override;
@@ -579,8 +586,10 @@ ChangeStatus AAReturnedValuesImpl::manifest(Attributor &A) {
   assert(isValidState());
   NumFnKnownReturns++;
 
+  auto *LivenessAA = A.getAAFor<AAIsDead>(*this, getAnchorScope());
+
   // Check if we have an assumed unique return value that we could manifest.
-  Optional<Value *> UniqueRV = getAssumedUniqueReturnValue();
+  Optional<Value *> UniqueRV = getAssumedUniqueReturnValue(LivenessAA);
 
   if (!UniqueRV.hasValue() || !UniqueRV.getValue())
     return Changed;
@@ -602,7 +611,8 @@ const std::string AAReturnedValuesImpl::getAsStr() const {
          (isValidState() ? std::to_string(getNumReturnValues()) : "?") + ")";
 }
 
-Optional<Value *> AAReturnedValuesImpl::getAssumedUniqueReturnValue() const {
+Optional<Value *> AAReturnedValuesImpl::getAssumedUniqueReturnValue(
+    const AAIsDead *LivenessAA) const {
   // If checkForallReturnedValues provides a unique value, ignoring potential
   // undef values that can also be present, it is assumed to be the actual
   // return value and forwarded to the caller of this method. If there are
@@ -610,7 +620,26 @@ Optional<Value *> AAReturnedValuesImpl::getAssumedUniqueReturnValue() const {
   // returned value.
   Optional<Value *> UniqueRV;
 
-  std::function<bool(Value &)> Pred = [&](Value &RV) -> bool {
+  std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> Pred =
+      [&](Value &RV, SmallPtrSet<ReturnInst *, 2> &RetInsts) -> bool {
+
+    bool IsLive = false;
+
+    if (LivenessAA) {
+      for (auto RI : RetInsts) {
+        if (!LivenessAA->isAssumedDead(RI->getParent())) {
+          // If at least one RI is live, then ReturnValue is not dead.
+          IsLive = true;
+          break;
+        }
+      }
+
+      if (!IsLive) {
+        UniqueRV = nullptr;
+        return false;
+      }
+    }
+
     // If we found a second returned value and neither the current nor the saved
     // one is an undef, there is no unique returned value. Undefs are special
     // since we can pretend they have any value.
@@ -634,20 +663,22 @@ Optional<Value *> AAReturnedValuesImpl::getAssumedUniqueReturnValue() const {
 }
 
 bool AAReturnedValuesImpl::checkForallReturnedValues(
-    std::function<bool(Value &)> &Pred) const {
+    std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> &Pred) const {
   if (!isValidState())
     return false;
 
   // Check all returned values but ignore call sites as long as we have not
   // encountered an overdefined one during an update.
   for (auto &It : ReturnedValues) {
+
     Value *RV = It.first;
+    SmallPtrSet<ReturnInst *, 2> RetInsts = It.second;
 
     ImmutableCallSite ICS(RV);
     if (ICS && !HasOverdefinedReturnedCalls)
       continue;
 
-    if (!Pred(*RV))
+    if (!Pred(*RV, RetInsts))
       return false;
   }
 
@@ -667,9 +698,26 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
   decltype(ReturnedValues) AddRVs;
   bool HasCallSite = false;
 
+  auto *LivenessAA = A.getAAFor<AAIsDead>(*this, getAnchorScope());
+
   // Look at all returned call sites.
   for (auto &It : ReturnedValues) {
     SmallPtrSet<ReturnInst *, 2> &ReturnInsts = It.second;
+
+    if (LivenessAA) {
+      bool IsLive = false;
+      for (auto RI : ReturnInsts) {
+        if (!LivenessAA->isAssumedDead(RI->getParent())) {
+          // At least one RI is live, so ReturnValues is not dead.
+          IsLive = true;
+          break;
+        }
+      }
+
+      if (!IsLive)
+        continue;
+    }
+
     Value *RV = It.first;
     LLVM_DEBUG(dbgs() << "[AAReturnedValues] Potentially returned value " << *RV
                       << "\n");
@@ -695,7 +743,7 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
     }
 
     // Try to find a assumed unique return value for the called function.
-    Optional<Value *> AssumedUniqueRV = RetCSAA->getAssumedUniqueReturnValue();
+    Optional<Value *> AssumedUniqueRV = RetCSAA->getAssumedUniqueReturnValue(LivenessAA);
 
     // If no assumed unique return value was found due to the lack of
     // candidates, we may need to resolve more calls (through more update
@@ -893,9 +941,16 @@ bool AANoSyncFunction::isVolatile(Instruction *I) {
 ChangeStatus AANoSyncFunction::updateImpl(Attributor &A) {
   Function &F = getAnchorScope();
 
+  auto *LivenessAA = A.getAAFor<AAIsDead>(*this, F);
+
   /// We are looking for volatile instructions or Non-Relaxed atomics.
   /// FIXME: We should ipmrove the handling of intrinsics.
   for (Instruction *I : InfoCache.getReadOrWriteInstsForFunction(F)) {
+    // Skip assumed dead blocks.
+    if (LivenessAA && LivenessAA->isAssumedDead(I->getParent())) {
+      continue;
+    }
+
     ImmutableCallSite ICS(I);
     auto *NoSyncAA = A.getAAFor<AANoSyncFunction>(*this, *I);
 
@@ -924,6 +979,9 @@ ChangeStatus AANoSyncFunction::updateImpl(Attributor &A) {
 
   for (unsigned Opcode : Opcodes) {
     for (Instruction *I : OpcodeInstMap[Opcode]) {
+      // Skip assumed dead blocks.
+      if (LivenessAA && LivenessAA->isAssumedDead(I->getParent()))
+        continue;
       // At this point we handled all read/write effects and they are all
       // nosync, so they can be skipped.
       if (I->mayReadOrWriteMemory())
@@ -987,10 +1045,15 @@ ChangeStatus AANoFreeFunction::updateImpl(Attributor &A) {
   // The map from instruction opcodes to those instructions in the function.
   auto &OpcodeInstMap = InfoCache.getOpcodeInstMapForFunction(F);
 
+  auto *LivenessAA = A.getAAFor<AAIsDead>(*this, F);
+
   for (unsigned Opcode :
        {(unsigned)Instruction::Invoke, (unsigned)Instruction::CallBr,
         (unsigned)Instruction::Call}) {
     for (Instruction *I : OpcodeInstMap[Opcode]) {
+      // Skip assumed dead blocks.
+      if (LivenessAA && LivenessAA->isAssumedDead(I->getParent()))
+        continue;
 
       auto ICS = ImmutableCallSite(I);
       auto *NoFreeAA = A.getAAFor<AANoFreeFunction>(*this, *I);
@@ -1038,17 +1101,20 @@ struct AANonNullImpl : AANonNull, BooleanState {
   /// (i) A value is known nonZero(=nonnull).
   /// (ii) A value is associated with AANonNull and its isAssumedNonNull() is
   /// true.
-  std::function<bool(Value &)> generatePredicate(Attributor &);
+  std::function<bool(Value &, SmallPtrSet<ReturnInst * , 2> &)> generatePredicate(Attributor &);
 };
 
-std::function<bool(Value &)> AANonNullImpl::generatePredicate(Attributor &A) {
+std::function<bool(Value &, SmallPtrSet<ReturnInst * , 2> &)> AANonNullImpl::generatePredicate(Attributor &A) {
   // FIXME: The `AAReturnedValues` should provide the predicate with the
   // `ReturnInst` vector as well such that we can use the control flow sensitive
   // version of `isKnownNonZero`. This should fix `test11` in
   // `test/Transforms/FunctionAttrs/nonnull.ll`
 
-  std::function<bool(Value &)> Pred = [&](Value &RV) -> bool {
-    if (isKnownNonZero(&RV, getAnchorScope().getParent()->getDataLayout()))
+  std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> Pred =
+      [&](Value &RV, SmallPtrSet<ReturnInst *, 2> &RetInsts) -> bool {
+    Function &F = getAnchorScope();
+
+    if (isKnownNonZero(&RV, F.getParent()->getDataLayout()))
       return true;
 
     auto *NonNullAA = A.getAAFor<AANonNull>(*this, RV);
@@ -1097,7 +1163,7 @@ ChangeStatus AANonNullReturned::updateImpl(Attributor &A) {
     return ChangeStatus::CHANGED;
   }
 
-  std::function<bool(Value &)> Pred = this->generatePredicate(A);
+  std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> Pred = this->generatePredicate(A);
   if (!AARetVal->checkForallReturnedValues(Pred)) {
     indicatePessimisticFixpoint();
     return ChangeStatus::CHANGED;
@@ -1166,6 +1232,13 @@ ChangeStatus AANonNullArgument::updateImpl(Attributor &A) {
   // Callback function
   std::function<bool(CallSite)> CallSiteCheck = [&](CallSite CS) {
     assert(CS && "Sanity check: Call site was not initialized properly!");
+
+    auto *LivenessAA = A.getAAFor<AAIsDead>(*this, F);
+
+    // Skip assumed dead blocks.
+
+    if (LivenessAA && LivenessAA->isAssumedDead(CS.getInstruction()->getParent()))
+      return true;
 
     auto *NonNullAA = A.getAAFor<AANonNull>(*this, *CS.getInstruction(), ArgNo);
 
@@ -1288,10 +1361,16 @@ ChangeStatus AAWillReturnFunction::updateImpl(Attributor &A) {
   // The map from instruction opcodes to those instructions in the function.
   auto &OpcodeInstMap = InfoCache.getOpcodeInstMapForFunction(F);
 
+  auto *LivenessAA = A.getAAFor<AAIsDead>(*this, F);
+
   for (unsigned Opcode :
        {(unsigned)Instruction::Invoke, (unsigned)Instruction::CallBr,
         (unsigned)Instruction::Call}) {
     for (Instruction *I : OpcodeInstMap[Opcode]) {
+      // Skip assumed dead blocks.
+      if (LivenessAA && LivenessAA->isAssumedDead(I->getParent()))
+        continue;
+
       auto ICS = ImmutableCallSite(I);
 
       if (ICS.hasFnAttr(Attribute::WillReturn))
@@ -1379,7 +1458,8 @@ ChangeStatus AANoAliasReturned::updateImpl(Attributor &A) {
     return ChangeStatus::CHANGED;
   }
 
-  std::function<bool(Value &)> Pred = [&](Value &RV) -> bool {
+  std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> Pred =
+      [&](Value &RV, SmallPtrSet<ReturnInst *, 2> &RetInsts) -> bool {
     if (Constant *C = dyn_cast<Constant>(&RV))
       if (C->isNullValue() || isa<UndefValue>(C))
         return true;
@@ -1575,7 +1655,7 @@ ChangeStatus AAIsDeadFunction::updateImpl(Attributor &A) {
 
   LLVM_DEBUG(dbgs() << "[AAIsDead] AssumedLiveBlocks: "
                     << AssumedLiveBlocks.size()
-                    << "Total number of blocks: "
+                    << " Total number of blocks: "
                     << getAnchorScope().size() << "\n");
 
   return Status;

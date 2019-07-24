@@ -671,8 +671,9 @@ struct AAReturnedValues : public AbstractAttribute {
   /// This method will evaluate \p Pred on returned values and return
   /// true if (1) all returned values are known, and (2) \p Pred returned true
   /// for all returned values.
-  virtual bool
-  checkForallReturnedValues(std::function<bool(Value &)> &Pred) const = 0;
+  virtual bool checkForallReturnedValues(
+      std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> &Pred)
+      const = 0;
 
   /// See AbstractAttribute::getAttrKind()
   Attribute::AttrKind getAttrKind() const override { return ID; }
