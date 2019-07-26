@@ -8,8 +8,9 @@ declare i32 @foo()
 
 declare i32 @foo_noreturn() noreturn
 
-declare i32 @bar()
+declare i32 @bar() nosync readnone
 
+; CHECK: Function Attrs: nofree norecurse nounwind uwtable willreturn
 define i32 @volatile_load(i32*) norecurse nounwind uwtable {
   %2 = load volatile i32, i32* %0, align 4
   ret i32 %2
@@ -48,8 +49,8 @@ cond.end:                                         ; preds = %cond.false, %cond.t
 ; This is just an example. For example we can put a sync call in a
 ; dead block and check if it is deduced.
 
-; FIXME: This function should be marked nosync, because @volatile_load is
-; called in a dead block.
+; CHECK: Function Attrs: nosync
+; CHECK-NEXT: define i32 @dead_block_present(i32 %a, i32* %ptr1)
 define i32 @dead_block_present(i32 %a, i32* %ptr1) #0 {
 entry:
   %cmp = icmp eq i32 %a, 0
@@ -59,7 +60,8 @@ cond.true:                                        ; preds = %entry
   call void @no_return_call()
   ; CHECK: call void @no_return_call()
   ; CHECK-NEXT: unreachable
-  %call = call i32 @volatile_load(i32* %ptr1)
+;  %call = call i32 @volatile_load(i32* %ptr1)
+  %call = call i32 @bar()
   br label %cond.end
 
 cond.false:                                       ; preds = %entry

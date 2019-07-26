@@ -425,7 +425,7 @@ ChangeStatus AANoUnwindFunction::updateImpl(Attributor &A) {
   for (unsigned Opcode : Opcodes) {
     for (Instruction *I : OpcodeInstMap[Opcode]) {
       // Skip dead blocks.
-      if (LivenessAA && LivenessAA->isAssumedDead(I->getParent()))
+      if (LivenessAA && LivenessAA->isAssumedDead(I))
         continue;
 
       if (!I->mayThrow())
@@ -556,7 +556,7 @@ public:
 
   /// See AbstractState::checkForallReturnedValues(...).
   bool checkForallReturnedValues(
-      std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> &Pred)
+      std::function<bool(Value &, const SmallPtrSetImpl<ReturnInst *> &)> &Pred)
       const override;
 
   /// Pretty print the attribute similar to the IR representation.
@@ -576,6 +576,25 @@ public:
   void indicatePessimisticFixpoint() override {
     IsFixed = true;
     IsValidState = false;
+  }
+
+  static bool isLiveRetValue(const AAIsDead *LivenessAA,
+                             const SmallPtrSetImpl<ReturnInst *> &ReturnInsts) {
+    if (!LivenessAA)
+      return true;
+
+    bool IsLive = false;
+    for(auto RI : ReturnInsts) {
+      if (!LivenessAA->isAssumedDead(RI)) {
+        // At least one RI is live, so ReturnValue is not dead.
+        IsLive = true;
+        break;
+      }
+    }
+
+    if (IsLive)
+      return true;
+    return false;
   }
 };
 
@@ -620,25 +639,12 @@ Optional<Value *> AAReturnedValuesImpl::getAssumedUniqueReturnValue(
   // returned value.
   Optional<Value *> UniqueRV;
 
-  std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> Pred =
-      [&](Value &RV, SmallPtrSet<ReturnInst *, 2> &RetInsts) -> bool {
-
-    bool IsLive = false;
-
-    if (LivenessAA) {
-      for (auto RI : RetInsts) {
-        if (!LivenessAA->isAssumedDead(RI->getParent())) {
-          // If at least one RI is live, then ReturnValue is not dead.
-          IsLive = true;
-          break;
-        }
-      }
-
-      if (!IsLive) {
-        UniqueRV = nullptr;
-        return false;
-      }
-    }
+  std::function<bool(Value &, const SmallPtrSetImpl<ReturnInst *> &)> Pred =
+      [&](Value &RV, const SmallPtrSetImpl<ReturnInst *> &RetInsts) -> bool {
+    // If all ReturnInsts are dead, then ReturnValue is dead as well
+    // and can be ignored.
+    if (!isLiveRetValue(LivenessAA, RetInsts))
+      return true;
 
     // If we found a second returned value and neither the current nor the saved
     // one is an undef, there is no unique returned value. Undefs are special
@@ -663,7 +669,7 @@ Optional<Value *> AAReturnedValuesImpl::getAssumedUniqueReturnValue(
 }
 
 bool AAReturnedValuesImpl::checkForallReturnedValues(
-    std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> &Pred) const {
+    std::function<bool(Value &, const SmallPtrSetImpl<ReturnInst *> &)> &Pred) const {
   if (!isValidState())
     return false;
 
@@ -672,7 +678,7 @@ bool AAReturnedValuesImpl::checkForallReturnedValues(
   for (auto &It : ReturnedValues) {
 
     Value *RV = It.first;
-    SmallPtrSet<ReturnInst *, 2> RetInsts = It.second;
+    const SmallPtrSetImpl<ReturnInst *> &RetInsts = It.second;
 
     ImmutableCallSite ICS(RV);
     if (ICS && !HasOverdefinedReturnedCalls)
@@ -698,25 +704,18 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
   decltype(ReturnedValues) AddRVs;
   bool HasCallSite = false;
 
+  // Keep track of any change to trigger updates on dependent attributes.
+  ChangeStatus Changed = ChangeStatus::UNCHANGED;
+
   auto *LivenessAA = A.getAAFor<AAIsDead>(*this, getAnchorScope());
 
   // Look at all returned call sites.
   for (auto &It : ReturnedValues) {
     SmallPtrSet<ReturnInst *, 2> &ReturnInsts = It.second;
 
-    if (LivenessAA) {
-      bool IsLive = false;
-      for (auto RI : ReturnInsts) {
-        if (!LivenessAA->isAssumedDead(RI->getParent())) {
-          // At least one RI is live, so ReturnValues is not dead.
-          IsLive = true;
-          break;
-        }
-      }
-
-      if (!IsLive)
-        continue;
-    }
+    // Ignore dead ReturnValues.
+    if (!isLiveRetValue(LivenessAA, ReturnInsts))
+      continue;
 
     Value *RV = It.first;
     LLVM_DEBUG(dbgs() << "[AAReturnedValues] Potentially returned value " << *RV
@@ -735,6 +734,8 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
     // Try to find a assumed unique return value for the called function.
     auto *RetCSAA = A.getAAFor<AAReturnedValuesImpl>(*this, *RV);
     if (!RetCSAA) {
+      if (!HasOverdefinedReturnedCalls)
+        Changed = ChangeStatus::CHANGED;
       HasOverdefinedReturnedCalls = true;
       LLVM_DEBUG(dbgs() << "[AAReturnedValues] Returned call site (" << *RV
                         << ") with " << (RetCSAA ? "invalid" : "no")
@@ -756,6 +757,8 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
     // If multiple, non-refinable values were found, there cannot be a unique
     // return value for the called function. The returned call is overdefined!
     if (!AssumedUniqueRV.getValue()) {
+      if (!HasOverdefinedReturnedCalls)
+        Changed = ChangeStatus::CHANGED;
       HasOverdefinedReturnedCalls = true;
       LLVM_DEBUG(dbgs() << "[AAReturnedValues] Returned call site has multiple "
                            "potentially returned values\n");
@@ -783,9 +786,6 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
     else
       AddRVs[AssumedRetVal].insert(ReturnInsts.begin(), ReturnInsts.end());
   }
-
-  // Keep track of any change to trigger updates on dependent attributes.
-  ChangeStatus Changed = ChangeStatus::UNCHANGED;
 
   for (auto &It : AddRVs) {
     assert(!It.second.empty() && "Entry does not add anything.");
@@ -947,9 +947,8 @@ ChangeStatus AANoSyncFunction::updateImpl(Attributor &A) {
   /// FIXME: We should ipmrove the handling of intrinsics.
   for (Instruction *I : InfoCache.getReadOrWriteInstsForFunction(F)) {
     // Skip assumed dead blocks.
-    if (LivenessAA && LivenessAA->isAssumedDead(I->getParent())) {
+    if (LivenessAA && LivenessAA->isAssumedDead(I))
       continue;
-    }
 
     ImmutableCallSite ICS(I);
     auto *NoSyncAA = A.getAAFor<AANoSyncFunction>(*this, *I);
@@ -980,7 +979,7 @@ ChangeStatus AANoSyncFunction::updateImpl(Attributor &A) {
   for (unsigned Opcode : Opcodes) {
     for (Instruction *I : OpcodeInstMap[Opcode]) {
       // Skip assumed dead blocks.
-      if (LivenessAA && LivenessAA->isAssumedDead(I->getParent()))
+      if (LivenessAA && LivenessAA->isAssumedDead(I))
         continue;
       // At this point we handled all read/write effects and they are all
       // nosync, so they can be skipped.
@@ -1052,7 +1051,7 @@ ChangeStatus AANoFreeFunction::updateImpl(Attributor &A) {
         (unsigned)Instruction::Call}) {
     for (Instruction *I : OpcodeInstMap[Opcode]) {
       // Skip assumed dead blocks.
-      if (LivenessAA && LivenessAA->isAssumedDead(I->getParent()))
+      if (LivenessAA && LivenessAA->isAssumedDead(I))
         continue;
 
       auto ICS = ImmutableCallSite(I);
@@ -1101,17 +1100,19 @@ struct AANonNullImpl : AANonNull, BooleanState {
   /// (i) A value is known nonZero(=nonnull).
   /// (ii) A value is associated with AANonNull and its isAssumedNonNull() is
   /// true.
-  std::function<bool(Value &, SmallPtrSet<ReturnInst * , 2> &)> generatePredicate(Attributor &);
+  std::function<bool(Value &, const SmallPtrSetImpl<ReturnInst *> &)>
+  generatePredicate(Attributor &);
 };
 
-std::function<bool(Value &, SmallPtrSet<ReturnInst * , 2> &)> AANonNullImpl::generatePredicate(Attributor &A) {
+std::function<bool(Value &, const SmallPtrSetImpl<ReturnInst *> &)>
+AANonNullImpl::generatePredicate(Attributor &A) {
   // FIXME: The `AAReturnedValues` should provide the predicate with the
   // `ReturnInst` vector as well such that we can use the control flow sensitive
   // version of `isKnownNonZero`. This should fix `test11` in
   // `test/Transforms/FunctionAttrs/nonnull.ll`
 
-  std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> Pred =
-      [&](Value &RV, SmallPtrSet<ReturnInst *, 2> &RetInsts) -> bool {
+  std::function<bool(Value &, const SmallPtrSetImpl<ReturnInst *> &)> Pred =
+      [&](Value &RV, const SmallPtrSetImpl<ReturnInst *> &RetInsts) -> bool {
     Function &F = getAnchorScope();
 
     if (isKnownNonZero(&RV, F.getParent()->getDataLayout()))
@@ -1163,7 +1164,8 @@ ChangeStatus AANonNullReturned::updateImpl(Attributor &A) {
     return ChangeStatus::CHANGED;
   }
 
-  std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> Pred = this->generatePredicate(A);
+  std::function<bool(Value &, const SmallPtrSetImpl<ReturnInst *> &)> Pred =
+      this->generatePredicate(A);
   if (!AARetVal->checkForallReturnedValues(Pred)) {
     indicatePessimisticFixpoint();
     return ChangeStatus::CHANGED;
@@ -1236,8 +1238,7 @@ ChangeStatus AANonNullArgument::updateImpl(Attributor &A) {
     auto *LivenessAA = A.getAAFor<AAIsDead>(*this, F);
 
     // Skip assumed dead blocks.
-
-    if (LivenessAA && LivenessAA->isAssumedDead(CS.getInstruction()->getParent()))
+    if (LivenessAA && LivenessAA->isAssumedDead(CS.getInstruction()))
       return true;
 
     auto *NonNullAA = A.getAAFor<AANonNull>(*this, *CS.getInstruction(), ArgNo);
@@ -1368,7 +1369,7 @@ ChangeStatus AAWillReturnFunction::updateImpl(Attributor &A) {
         (unsigned)Instruction::Call}) {
     for (Instruction *I : OpcodeInstMap[Opcode]) {
       // Skip assumed dead blocks.
-      if (LivenessAA && LivenessAA->isAssumedDead(I->getParent()))
+      if (LivenessAA && LivenessAA->isAssumedDead(I))
         continue;
 
       auto ICS = ImmutableCallSite(I);
@@ -1458,8 +1459,8 @@ ChangeStatus AANoAliasReturned::updateImpl(Attributor &A) {
     return ChangeStatus::CHANGED;
   }
 
-  std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> Pred =
-      [&](Value &RV, SmallPtrSet<ReturnInst *, 2> &RetInsts) -> bool {
+  std::function<bool(Value &, const SmallPtrSetImpl<ReturnInst *> &)> Pred =
+      [&](Value &RV, const SmallPtrSetImpl<ReturnInst *> &RetInsts) -> bool {
     if (Constant *C = dyn_cast<Constant>(&RV))
       if (C->isNullValue() || isa<UndefValue>(C))
         return true;
@@ -1558,19 +1559,59 @@ struct AAIsDeadFunction : AAIsDead, BooleanState {
   /// See AbstractAttribute::updateImpl(...).
   ChangeStatus updateImpl(Attributor &A) override;
 
-  /// See AAIsDead::isAssumedDead().
+  /// See AAIsDead::isAssumedDead(BasicBlock *BB).
   bool isAssumedDead(BasicBlock *BB) const override {
     if (!getAssumed())
       return false;
     return !AssumedLiveBlocks.count(BB);
   }
 
-  /// See AAIsDead::isKnownDead().
+  /// See AAIsDead::isKnownDead(BasicBlock *BB).
   bool isKnownDead(BasicBlock *BB) const override {
     if (!getKnown())
       return false;
     return !AssumedLiveBlocks.count(BB);
   }
+
+  /// See AAIsDead::isAssumed(Instruction *I).
+  bool isAssumedDead(Instruction *I) const override {
+    if(!getAssumed())
+      return false;
+
+    // If it is not in AssumedLiveBlocks then it for sure dead.
+    // Otherwise, it can still be after noreturn call in a live block.
+    if (!AssumedLiveBlocks.count(I->getParent()))
+      return true;
+
+    // If it is not after a noreturn call, than it is live.
+    if (!isAfterNoReturn(I))
+      return false;
+
+    // Definitely dead.
+    return true;
+  }
+
+  /// See AAIsDead::isKnownDead(Instruction *I).
+  bool isKnownDead(Instruction *I) const override {
+    if(!getKnown())
+      return false;
+
+    // If it is not in AssumedLiveBlocks then it for sure dead.
+    // Otherwise, it can still be after noreturn call in a live block.
+    if (!AssumedLiveBlocks.count(I->getParent()))
+      return true;
+
+    // If I is not in AssumedLiveBlocks and not after a noreturn call, than it
+    // is live.
+    if (!isAfterNoReturn(I))
+      return false;
+
+    // Definitely dead.
+    return true;
+  }
+
+  /// Check if instruction is after noreturn call, in other words, assumed dead.
+  bool isAfterNoReturn(Instruction *I) const;
 
   /// Collection of to be explored paths.
   SmallSetVector<Instruction *, 8> ToBeExploredPaths;
@@ -1581,6 +1622,31 @@ struct AAIsDeadFunction : AAIsDead, BooleanState {
   /// Collection of calls with noreturn attribute, assumed or knwon.
   SmallSetVector<Instruction *, 4> NoReturnCalls;
 };
+
+bool AAIsDeadFunction::isAfterNoReturn(Instruction *I) const {
+  BasicBlock *BB = I->getParent();
+  Instruction *DeadInst = nullptr;
+
+  for (Instruction *NoRet : NoReturnCalls) {
+    if (NoRet->getParent() == BB) {
+      DeadInst = NoRet->getNextNode();
+      break;
+    }
+  }
+
+  // No noreturn calls in this block.
+  if (!DeadInst)
+    return false;
+
+  while (DeadInst) {
+    if (DeadInst == I)
+      return true;
+
+    DeadInst = DeadInst->getNextNode();
+  }
+
+  return false;
+}
 
 bool AAIsDeadFunction::explorePath(Attributor &A, Instruction *I) {
   BasicBlock *BB = I->getParent();
@@ -1628,6 +1694,8 @@ ChangeStatus AAIsDeadFunction::updateImpl(Attributor &A) {
   // will alow easier modification of NoReturnCalls collection
   SmallVector<Instruction *, 8> NoReturnChanged;
   ChangeStatus Status = ChangeStatus::UNCHANGED;
+  // ChangeStatus Status = NoReturnCalls.size() > 0 ? ChangeStatus::CHANGED
+                                                 // : ChangeStatus::UNCHANGED;
 
   for (Instruction *I : NoReturnCalls)
     NoReturnChanged.push_back(I);

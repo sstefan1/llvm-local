@@ -672,7 +672,7 @@ struct AAReturnedValues : public AbstractAttribute {
   /// true if (1) all returned values are known, and (2) \p Pred returned true
   /// for all returned values.
   virtual bool checkForallReturnedValues(
-      std::function<bool(Value &, SmallPtrSet<ReturnInst *, 2> &)> &Pred)
+      std::function<bool(Value &, const SmallPtrSetImpl<ReturnInst *> &)> &Pred)
       const = 0;
 
   /// See AbstractAttribute::getAttrKind()
@@ -844,6 +844,12 @@ struct AAIsDead : public AbstractAttribute {
 
   /// Returns true if \p BB is known dead.
   virtual bool isKnownDead(BasicBlock *BB) const = 0;
+
+  /// Returns true if \p I is assumed dead.
+  virtual bool isAssumedDead(Instruction *I) const = 0;
+
+  /// Returns true if \p I is known dead.
+  virtual bool isKnownDead(Instruction *I) const = 0;
 };
 
 } // end namespace llvm
