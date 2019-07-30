@@ -60,8 +60,8 @@ cond.true:                                        ; preds = %entry
   call void @no_return_call()
   ; CHECK: call void @no_return_call()
   ; CHECK-NEXT: unreachable
-;  %call = call i32 @volatile_load(i32* %ptr1)
-  %call = call i32 @bar()
+  %call = call i32 @volatile_load(i32* %ptr1)
+  ;%call = call i32 @bar()
   br label %cond.end
 
 cond.false:                                       ; preds = %entry

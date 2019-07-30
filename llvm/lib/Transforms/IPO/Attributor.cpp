@@ -585,6 +585,9 @@ public:
 
     bool IsLive = false;
     for(auto RI : ReturnInsts) {
+      assert(RI->getParent()->getParent() == &(LivenessAA->getAnchorScope()) &&
+             "Instruction must be in the same anchor scope function.");
+
       if (!LivenessAA->isAssumedDead(RI)) {
         // At least one RI is live, so ReturnValue is not dead.
         IsLive = true;
@@ -712,12 +715,12 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
   // Look at all returned call sites.
   for (auto &It : ReturnedValues) {
     SmallPtrSet<ReturnInst *, 2> &ReturnInsts = It.second;
+    Value *RV = It.first;
 
     // Ignore dead ReturnValues.
     if (!isLiveRetValue(LivenessAA, ReturnInsts))
       continue;
 
-    Value *RV = It.first;
     LLVM_DEBUG(dbgs() << "[AAReturnedValues] Potentially returned value " << *RV
                       << "\n");
 
@@ -743,8 +746,11 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
       continue;
     }
 
+    auto *LivenessCSAA = A.getAAFor<AAIsDead>(*this, RetCSAA->getAnchorScope());
+
     // Try to find a assumed unique return value for the called function.
-    Optional<Value *> AssumedUniqueRV = RetCSAA->getAssumedUniqueReturnValue(LivenessAA);
+    Optional<Value *> AssumedUniqueRV =
+        RetCSAA->getAssumedUniqueReturnValue(LivenessCSAA);
 
     // If no assumed unique return value was found due to the lack of
     // candidates, we may need to resolve more calls (through more update
@@ -1225,6 +1231,7 @@ struct AANonNullCallSiteArgument : AANonNullImpl {
 private:
   unsigned ArgNo;
 };
+
 ChangeStatus AANonNullArgument::updateImpl(Attributor &A) {
   Function &F = getAnchorScope();
   Argument &Arg = cast<Argument>(getAnchoredValue());
@@ -1235,7 +1242,9 @@ ChangeStatus AANonNullArgument::updateImpl(Attributor &A) {
   std::function<bool(CallSite)> CallSiteCheck = [&](CallSite CS) {
     assert(CS && "Sanity check: Call site was not initialized properly!");
 
-    auto *LivenessAA = A.getAAFor<AAIsDead>(*this, F);
+    // auto *LivenessAA = A.getAAFor<AAIsDead>(*this, F);
+    Function *AnchorValue = CS.getInstruction()->getParent()->getParent();
+    auto *LivenessAA = A.getAAFor<AAIsDead>(*this, *AnchorValue);
 
     // Skip assumed dead blocks.
     if (LivenessAA && LivenessAA->isAssumedDead(CS.getInstruction()))
@@ -1260,6 +1269,7 @@ ChangeStatus AANonNullArgument::updateImpl(Attributor &A) {
 
     return false;
   };
+
   if (!A.checkForAllCallSites(F, CallSiteCheck, true)) {
     indicatePessimisticFixpoint();
     return ChangeStatus::CHANGED;
@@ -1578,6 +1588,9 @@ struct AAIsDeadFunction : AAIsDead, BooleanState {
     if(!getAssumed())
       return false;
 
+    assert(I->getParent()->getParent() == &getAnchorScope() &&
+           "Instruction must be in the same anchor scope function.");
+
     // If it is not in AssumedLiveBlocks then it for sure dead.
     // Otherwise, it can still be after noreturn call in a live block.
     if (!AssumedLiveBlocks.count(I->getParent()))
@@ -1624,27 +1637,12 @@ struct AAIsDeadFunction : AAIsDead, BooleanState {
 };
 
 bool AAIsDeadFunction::isAfterNoReturn(Instruction *I) const {
-  BasicBlock *BB = I->getParent();
-  Instruction *DeadInst = nullptr;
-
-  for (Instruction *NoRet : NoReturnCalls) {
-    if (NoRet->getParent() == BB) {
-      DeadInst = NoRet->getNextNode();
-      break;
-    }
-  }
-
-  // No noreturn calls in this block.
-  if (!DeadInst)
-    return false;
-
-  while (DeadInst) {
-    if (DeadInst == I)
+  Instruction *PrevI = I->getPrevNode();
+  while (PrevI) {
+    if (NoReturnCalls.count(PrevI))
       return true;
-
-    DeadInst = DeadInst->getNextNode();
+    PrevI = PrevI->getPrevNode();
   }
-
   return false;
 }
 
@@ -1694,8 +1692,6 @@ ChangeStatus AAIsDeadFunction::updateImpl(Attributor &A) {
   // will alow easier modification of NoReturnCalls collection
   SmallVector<Instruction *, 8> NoReturnChanged;
   ChangeStatus Status = ChangeStatus::UNCHANGED;
-  // ChangeStatus Status = NoReturnCalls.size() > 0 ? ChangeStatus::CHANGED
-                                                 // : ChangeStatus::UNCHANGED;
 
   for (Instruction *I : NoReturnCalls)
     NoReturnChanged.push_back(I);
@@ -1709,12 +1705,12 @@ ChangeStatus AAIsDeadFunction::updateImpl(Attributor &A) {
 
     NoReturnCalls.remove(I);
 
+    // At least one new path.
+    Status = ChangeStatus::CHANGED;
+
     // No new paths.
     if (Size == ToBeExploredPaths.size())
       continue;
-
-    // At least one new path.
-    Status = ChangeStatus::CHANGED;
 
     // explore new paths.
     while (Size != ToBeExploredPaths.size())
