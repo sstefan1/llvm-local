@@ -578,23 +578,6 @@ public:
     IsFixed = true;
     IsValidState = false;
   }
-
-  // static bool isLiveRetValue(const AAIsDead *LivenessAA,
-                             // const SmallPtrSetImpl<ReturnInst *> &ReturnInsts) {
-    // if (!LivenessAA)
-      // return true;
-
-    // for (auto RI : ReturnInsts) {
-      // assert(RI->getParent()->getParent() == &(LivenessAA->getAnchorScope()) &&
-             // "Instruction must be in the same anchor scope function.");
-
-      // if (!LivenessAA->isAssumedDead(RI))
-        // // At least one RI is live, so ReturnValue is not dead.
-        // return true;
-    // }
-
-    // return false;
-  // }
 };
 
 ChangeStatus AAReturnedValuesImpl::manifest(Attributor &A) {
