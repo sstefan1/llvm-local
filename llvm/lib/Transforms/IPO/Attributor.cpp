@@ -573,32 +573,28 @@ public:
     IsFixed = true;
     IsValidState &= true;
   }
+
   void indicatePessimisticFixpoint() override {
     IsFixed = true;
     IsValidState = false;
   }
 
-  static bool isLiveRetValue(const AAIsDead *LivenessAA,
-                             const SmallPtrSetImpl<ReturnInst *> &ReturnInsts) {
-    if (!LivenessAA)
-      return true;
+  // static bool isLiveRetValue(const AAIsDead *LivenessAA,
+                             // const SmallPtrSetImpl<ReturnInst *> &ReturnInsts) {
+    // if (!LivenessAA)
+      // return true;
 
-    bool IsLive = false;
-    for(auto RI : ReturnInsts) {
-      assert(RI->getParent()->getParent() == &(LivenessAA->getAnchorScope()) &&
-             "Instruction must be in the same anchor scope function.");
+    // for (auto RI : ReturnInsts) {
+      // assert(RI->getParent()->getParent() == &(LivenessAA->getAnchorScope()) &&
+             // "Instruction must be in the same anchor scope function.");
 
-      if (!LivenessAA->isAssumedDead(RI)) {
-        // At least one RI is live, so ReturnValue is not dead.
-        IsLive = true;
-        break;
-      }
-    }
+      // if (!LivenessAA->isAssumedDead(RI))
+        // // At least one RI is live, so ReturnValue is not dead.
+        // return true;
+    // }
 
-    if (IsLive)
-      return true;
-    return false;
-  }
+    // return false;
+  // }
 };
 
 ChangeStatus AAReturnedValuesImpl::manifest(Attributor &A) {
@@ -646,7 +642,8 @@ Optional<Value *> AAReturnedValuesImpl::getAssumedUniqueReturnValue(
       [&](Value &RV, const SmallPtrSetImpl<ReturnInst *> &RetInsts) -> bool {
     // If all ReturnInsts are dead, then ReturnValue is dead as well
     // and can be ignored.
-    if (!isLiveRetValue(LivenessAA, RetInsts))
+
+    if (!LivenessAA->isLiveInstSet(RetInsts.begin(), RetInsts.end()))
       return true;
 
     // If we found a second returned value and neither the current nor the saved
@@ -718,7 +715,7 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
     Value *RV = It.first;
 
     // Ignore dead ReturnValues.
-    if (!isLiveRetValue(LivenessAA, ReturnInsts))
+    if (!LivenessAA->isLiveInstSet(ReturnInsts.begin(), ReturnInsts.end()))
       continue;
 
     LLVM_DEBUG(dbgs() << "[AAReturnedValues] Potentially returned value " << *RV
@@ -737,8 +734,6 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
     // Try to find a assumed unique return value for the called function.
     auto *RetCSAA = A.getAAFor<AAReturnedValuesImpl>(*this, *RV);
     if (!RetCSAA) {
-      if (!HasOverdefinedReturnedCalls)
-        Changed = ChangeStatus::CHANGED;
       HasOverdefinedReturnedCalls = true;
       LLVM_DEBUG(dbgs() << "[AAReturnedValues] Returned call site (" << *RV
                         << ") with " << (RetCSAA ? "invalid" : "no")
@@ -763,8 +758,6 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
     // If multiple, non-refinable values were found, there cannot be a unique
     // return value for the called function. The returned call is overdefined!
     if (!AssumedUniqueRV.getValue()) {
-      if (!HasOverdefinedReturnedCalls)
-        Changed = ChangeStatus::CHANGED;
       HasOverdefinedReturnedCalls = true;
       LLVM_DEBUG(dbgs() << "[AAReturnedValues] Returned call site has multiple "
                            "potentially returned values\n");
@@ -1242,14 +1235,6 @@ ChangeStatus AANonNullArgument::updateImpl(Attributor &A) {
   std::function<bool(CallSite)> CallSiteCheck = [&](CallSite CS) {
     assert(CS && "Sanity check: Call site was not initialized properly!");
 
-    // auto *LivenessAA = A.getAAFor<AAIsDead>(*this, F);
-    Function *AnchorValue = CS.getInstruction()->getParent()->getParent();
-    auto *LivenessAA = A.getAAFor<AAIsDead>(*this, *AnchorValue);
-
-    // Skip assumed dead blocks.
-    if (LivenessAA && LivenessAA->isAssumedDead(CS.getInstruction()))
-      return true;
-
     auto *NonNullAA = A.getAAFor<AANonNull>(*this, *CS.getInstruction(), ArgNo);
 
     // Check that NonNullAA is AANonNullCallSiteArgument.
@@ -1270,7 +1255,7 @@ ChangeStatus AANonNullArgument::updateImpl(Attributor &A) {
     return false;
   };
 
-  if (!A.checkForAllCallSites(F, CallSiteCheck, true)) {
+  if (!A.checkForAllCallSites(F, CallSiteCheck, true, this)) {
     indicatePessimisticFixpoint();
     return ChangeStatus::CHANGED;
   }
@@ -1571,6 +1556,9 @@ struct AAIsDeadFunction : AAIsDead, BooleanState {
 
   /// See AAIsDead::isAssumedDead(BasicBlock *BB).
   bool isAssumedDead(BasicBlock *BB) const override {
+    assert(BB->getParent() == &getAnchorScope() &&
+           "BB must be in the same anchor scope function.");
+
     if (!getAssumed())
       return false;
     return !AssumedLiveBlocks.count(BB);
@@ -1578,18 +1566,16 @@ struct AAIsDeadFunction : AAIsDead, BooleanState {
 
   /// See AAIsDead::isKnownDead(BasicBlock *BB).
   bool isKnownDead(BasicBlock *BB) const override {
-    if (!getKnown())
-      return false;
-    return !AssumedLiveBlocks.count(BB);
+    return getKnown() && isAssumedDead(BB);
   }
 
   /// See AAIsDead::isAssumed(Instruction *I).
   bool isAssumedDead(Instruction *I) const override {
-    if(!getAssumed())
-      return false;
-
     assert(I->getParent()->getParent() == &getAnchorScope() &&
            "Instruction must be in the same anchor scope function.");
+
+    if(!getAssumed())
+      return false;
 
     // If it is not in AssumedLiveBlocks then it for sure dead.
     // Otherwise, it can still be after noreturn call in a live block.
@@ -1606,21 +1592,7 @@ struct AAIsDeadFunction : AAIsDead, BooleanState {
 
   /// See AAIsDead::isKnownDead(Instruction *I).
   bool isKnownDead(Instruction *I) const override {
-    if(!getKnown())
-      return false;
-
-    // If it is not in AssumedLiveBlocks then it for sure dead.
-    // Otherwise, it can still be after noreturn call in a live block.
-    if (!AssumedLiveBlocks.count(I->getParent()))
-      return true;
-
-    // If I is not in AssumedLiveBlocks and not after a noreturn call, than it
-    // is live.
-    if (!isAfterNoReturn(I))
-      return false;
-
-    // Definitely dead.
-    return true;
+    return getKnown() && isAssumedDead(I);
   }
 
   /// Check if instruction is after noreturn call, in other words, assumed dead.
@@ -1731,7 +1703,8 @@ ChangeStatus AAIsDeadFunction::updateImpl(Attributor &A) {
 
 bool Attributor::checkForAllCallSites(Function &F,
                                       std::function<bool(CallSite)> &Pred,
-                                      bool RequireAllCallSites) {
+                                      bool RequireAllCallSites,
+                                      AbstractAttribute *AA) {
   // We can try to determine information from
   // the call sites. However, this is only possible all call sites are known,
   // hence the function has internal linkage.
@@ -1754,6 +1727,12 @@ bool Attributor::checkForAllCallSites(Function &F,
                         << " is an invalid use of " << F.getName() << "\n");
       return false;
     }
+
+    Function *AnchorValue = CS.getInstruction()->getParent()->getParent();
+    auto *LivenessAA = getAAFor<AAIsDead>(*AA, *AnchorValue);
+
+    if (LivenessAA && LivenessAA->isAssumedDead(CS.getInstruction()))
+      return true;
 
     if (Pred(CS))
       continue;

@@ -269,7 +269,7 @@ struct Attributor {
   /// true if \p Pred holds in every call sites. However, this is only possible
   /// all call sites are known, hence the function has internal linkage.
   bool checkForAllCallSites(Function &F, std::function<bool(CallSite)> &Pred,
-                            bool RequireAllCallSites);
+                            bool RequireAllCallSites, AbstractAttribute *AA);
 
 private:
   /// The set of all abstract attributes.
@@ -850,6 +850,20 @@ struct AAIsDead : public AbstractAttribute {
 
   /// Returns true if \p I is known dead.
   virtual bool isKnownDead(Instruction *I) const = 0;
+
+  template <typename T>
+  bool isLiveInstSet(T begin, T end) const {
+    for (T I = begin; I != end; ++I) {
+      assert(isa<Instruction>(*I) && "It has to be collection of Instructions");
+      assert((*I)->getParent()->getParent() == &getAnchorScope() &&
+             "Instruction must be in the same anchor scope function.");
+
+      if (!isAssumedDead(*I))
+        return true;
+    }
+
+    return false;
+  }
 };
 
 } // end namespace llvm
