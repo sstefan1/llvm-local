@@ -851,6 +851,8 @@ struct AAIsDead : public AbstractAttribute {
   /// Returns true if \p I is known dead.
   virtual bool isKnownDead(Instruction *I) const = 0;
 
+  /// This method is used to check if at least one instruction in a collection
+  /// of instructions is live.
   template <typename T>
   bool isLiveInstSet(T begin, T end) const {
     for (T I = begin; I != end; ++I) {

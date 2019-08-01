@@ -424,7 +424,7 @@ ChangeStatus AANoUnwindFunction::updateImpl(Attributor &A) {
 
   for (unsigned Opcode : Opcodes) {
     for (Instruction *I : OpcodeInstMap[Opcode]) {
-      // Skip dead blocks.
+      // Skip dead instructions.
       if (LivenessAA && LivenessAA->isAssumedDead(I))
         continue;
 
@@ -623,10 +623,11 @@ Optional<Value *> AAReturnedValuesImpl::getAssumedUniqueReturnValue(
 
   std::function<bool(Value &, const SmallPtrSetImpl<ReturnInst *> &)> Pred =
       [&](Value &RV, const SmallPtrSetImpl<ReturnInst *> &RetInsts) -> bool {
+
     // If all ReturnInsts are dead, then ReturnValue is dead as well
     // and can be ignored.
-
-    if (!LivenessAA->isLiveInstSet(RetInsts.begin(), RetInsts.end()))
+    if (LivenessAA &&
+        !LivenessAA->isLiveInstSet(RetInsts.begin(), RetInsts.end()))
       return true;
 
     // If we found a second returned value and neither the current nor the saved
@@ -698,7 +699,7 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
     Value *RV = It.first;
 
     // Ignore dead ReturnValues.
-    if (!LivenessAA->isLiveInstSet(ReturnInsts.begin(), ReturnInsts.end()))
+    if (LivenessAA && !LivenessAA->isLiveInstSet(ReturnInsts.begin(), ReturnInsts.end()))
       continue;
 
     LLVM_DEBUG(dbgs() << "[AAReturnedValues] Potentially returned value " << *RV
@@ -928,7 +929,7 @@ ChangeStatus AANoSyncFunction::updateImpl(Attributor &A) {
   /// We are looking for volatile instructions or Non-Relaxed atomics.
   /// FIXME: We should ipmrove the handling of intrinsics.
   for (Instruction *I : InfoCache.getReadOrWriteInstsForFunction(F)) {
-    // Skip assumed dead blocks.
+    // Skip assumed dead instructions.
     if (LivenessAA && LivenessAA->isAssumedDead(I))
       continue;
 
@@ -960,7 +961,7 @@ ChangeStatus AANoSyncFunction::updateImpl(Attributor &A) {
 
   for (unsigned Opcode : Opcodes) {
     for (Instruction *I : OpcodeInstMap[Opcode]) {
-      // Skip assumed dead blocks.
+      // Skip assumed dead instructions.
       if (LivenessAA && LivenessAA->isAssumedDead(I))
         continue;
       // At this point we handled all read/write effects and they are all
@@ -1032,7 +1033,7 @@ ChangeStatus AANoFreeFunction::updateImpl(Attributor &A) {
        {(unsigned)Instruction::Invoke, (unsigned)Instruction::CallBr,
         (unsigned)Instruction::Call}) {
     for (Instruction *I : OpcodeInstMap[Opcode]) {
-      // Skip assumed dead blocks.
+      // Skip assumed dead instructions.
       if (LivenessAA && LivenessAA->isAssumedDead(I))
         continue;
 
@@ -1346,7 +1347,7 @@ ChangeStatus AAWillReturnFunction::updateImpl(Attributor &A) {
        {(unsigned)Instruction::Invoke, (unsigned)Instruction::CallBr,
         (unsigned)Instruction::Call}) {
     for (Instruction *I : OpcodeInstMap[Opcode]) {
-      // Skip assumed dead blocks.
+      // Skip assumed dead instructions.
       if (LivenessAA && LivenessAA->isAssumedDead(I))
         continue;
 
@@ -1711,11 +1712,12 @@ bool Attributor::checkForAllCallSites(Function &F,
       return false;
     }
 
-    Function *AnchorValue = CS.getInstruction()->getParent()->getParent();
+    Function *AnchorValue = CS->getFunction();
     auto *LivenessAA = getAAFor<AAIsDead>(*AA, *AnchorValue);
 
+    // Skip dead calls.
     if (LivenessAA && LivenessAA->isAssumedDead(CS.getInstruction()))
-      return true;
+        continue;
 
     if (Pred(CS))
       continue;

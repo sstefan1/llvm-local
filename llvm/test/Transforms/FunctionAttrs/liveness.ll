@@ -16,12 +16,20 @@ define i32 @volatile_load(i32*) norecurse nounwind uwtable {
   ret i32 %2
 }
 
+; CHECK: Function Attrs: nofree norecurse nosync nounwind uwtable willreturn
+; CHECK-NEXT: define internal i32 @internal_load(i32* nonnull)
+define internal i32 @internal_load(i32*) norecurse nounwind uwtable {
+  %2 = load i32, i32* %0, align 4
+  ret i32 %2
+}
 ; TEST 1: Only first block is live.
 
 ; CHECK: Function Attrs: nofree nosync nounwind
-; CHECK-NEXT: define i32 @first_block_no_return(i32 %a, i32* %ptr1)
-define i32 @first_block_no_return(i32 %a, i32* %ptr1) #0 {
+; CHECK-NEXT: define i32 @first_block_no_return(i32 %a, i32* nonnull %ptr1, i32* %ptr2)
+define i32 @first_block_no_return(i32 %a, i32* nonnull %ptr1, i32* %ptr2) #0 {
 entry:
+  call i32 @internal_load(i32* %ptr1)
+  ; CHECK: call i32 @internal_load(i32* nonnull %ptr1)
   call void @no_return_call()
   ; CHECK: call void @no_return_call()
   ; CHECK-NEXT: unreachable
@@ -29,6 +37,8 @@ entry:
   br i1 %cmp, label %cond.true, label %cond.false
 
 cond.true:                                        ; preds = %entry
+  call i32 @internal_load(i32* %ptr2)
+  ; CHECK: call i32 @internal_load(i32* %ptr2)
   %load = call i32 @volatile_load(i32* %ptr1)
   call void @normal_call()
   %call = call i32 @foo()
@@ -61,7 +71,6 @@ cond.true:                                        ; preds = %entry
   ; CHECK: call void @no_return_call()
   ; CHECK-NEXT: unreachable
   %call = call i32 @volatile_load(i32* %ptr1)
-  ;%call = call i32 @bar()
   br label %cond.end
 
 cond.false:                                       ; preds = %entry
