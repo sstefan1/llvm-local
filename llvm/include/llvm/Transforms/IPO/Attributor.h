@@ -269,7 +269,7 @@ struct Attributor {
   /// true if \p Pred holds in every call sites. However, this is only possible
   /// all call sites are known, hence the function has internal linkage.
   bool checkForAllCallSites(Function &F, std::function<bool(CallSite)> &Pred,
-                            bool RequireAllCallSites, AbstractAttribute *AA);
+                            bool RequireAllCallSites, AbstractAttribute &AA);
 
 private:
   /// The set of all abstract attributes.

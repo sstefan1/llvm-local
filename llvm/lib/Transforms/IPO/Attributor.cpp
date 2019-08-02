@@ -699,7 +699,8 @@ ChangeStatus AAReturnedValuesImpl::updateImpl(Attributor &A) {
     Value *RV = It.first;
 
     // Ignore dead ReturnValues.
-    if (LivenessAA && !LivenessAA->isLiveInstSet(ReturnInsts.begin(), ReturnInsts.end()))
+    if (LivenessAA &&
+        !LivenessAA->isLiveInstSet(ReturnInsts.begin(), ReturnInsts.end()))
       continue;
 
     LLVM_DEBUG(dbgs() << "[AAReturnedValues] Potentially returned value " << *RV
@@ -1239,7 +1240,7 @@ ChangeStatus AANonNullArgument::updateImpl(Attributor &A) {
     return false;
   };
 
-  if (!A.checkForAllCallSites(F, CallSiteCheck, true, this)) {
+  if (!A.checkForAllCallSites(F, CallSiteCheck, true, *this)) {
     indicatePessimisticFixpoint();
     return ChangeStatus::CHANGED;
   }
@@ -1688,7 +1689,7 @@ ChangeStatus AAIsDeadFunction::updateImpl(Attributor &A) {
 bool Attributor::checkForAllCallSites(Function &F,
                                       std::function<bool(CallSite)> &Pred,
                                       bool RequireAllCallSites,
-                                      AbstractAttribute *AA) {
+                                      AbstractAttribute &AA) {
   // We can try to determine information from
   // the call sites. However, this is only possible all call sites are known,
   // hence the function has internal linkage.
@@ -1701,6 +1702,14 @@ bool Attributor::checkForAllCallSites(Function &F,
   }
 
   for (const Use &U : F.uses()) {
+    Instruction *I = cast<Instruction>(U.getUser());
+    Function *AnchorValue = I->getParent()->getParent();
+
+    auto *LivenessAA = getAAFor<AAIsDead>(AA, *AnchorValue);
+
+    // Skip dead calls.
+    if (LivenessAA && LivenessAA->isAssumedDead(I))
+      continue;
 
     CallSite CS(U.getUser());
     if (!CS || !CS.isCallee(&U) || !CS.getCaller()->hasExactDefinition()) {
@@ -1711,13 +1720,6 @@ bool Attributor::checkForAllCallSites(Function &F,
                         << " is an invalid use of " << F.getName() << "\n");
       return false;
     }
-
-    Function *AnchorValue = CS->getFunction();
-    auto *LivenessAA = getAAFor<AAIsDead>(*AA, *AnchorValue);
-
-    // Skip dead calls.
-    if (LivenessAA && LivenessAA->isAssumedDead(CS.getInstruction()))
-        continue;
 
     if (Pred(CS))
       continue;

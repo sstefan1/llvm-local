@@ -22,6 +22,14 @@ define internal i32 @internal_load(i32*) norecurse nounwind uwtable {
   %2 = load i32, i32* %0, align 4
   ret i32 %2
 }
+
+; CHECK: Function Attrs: nofree nosync nounwind willreturn
+; CHECK-NEXT: define i32 @func_ptr(i32)
+define i32 @func_ptr(i32) {
+  %2 = add nsw i32 %0, 1
+  ret i32 %2
+}
+
 ; TEST 1: Only first block is live.
 
 ; CHECK: Function Attrs: nofree nosync nounwind
@@ -42,6 +50,8 @@ cond.true:                                        ; preds = %entry
   %load = call i32 @volatile_load(i32* %ptr1)
   call void @normal_call()
   %call = call i32 @foo()
+  %f_ptr = alloca i32 (i32)*, align 8
+  store i32 (i32)* @func_ptr, i32 (i32)** %f_ptr, align 8
   br label %cond.end
 
 cond.false:                                       ; preds = %entry
