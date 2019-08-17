@@ -97,6 +97,7 @@
 #define LLVM_TRANSFORMS_IPO_ATTRIBUTOR_H
 
 #include "llvm/ADT/SetVector.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/CallSite.h"
 #include "llvm/IR/PassManager.h"
 
@@ -151,6 +152,14 @@ struct InformationCache {
     return FuncRWInstsMap[&F];
   }
 
+  /// Return TargetLibraryInfo for function \p F.
+  TargetLibraryInfo *getTargetLibraryInfoForFunction(const Function &F) {
+    return FuncTLIMap[&F];
+  }
+
+  /// Return datalayout used in the module.
+  const DataLayout &getDL() { return DL; }
+
 private:
   /// A map type from functions to opcode to instruction maps.
   using FuncInstOpcodeMapTy = DenseMap<const Function *, OpcodeInstMapTy>;
@@ -158,12 +167,18 @@ private:
   /// A map type from functions to their read or write instructions.
   using FuncRWInstsMapTy = DenseMap<const Function *, InstructionVectorTy>;
 
+  /// A map type from functions to their TLI.
+  using FuncTLIMapTy = DenseMap<const Function *, TargetLibraryInfo *>;
+
   /// A nested map that remembers all instructions in a function with a certain
   /// instruction opcode (Instruction::getOpcode()).
   FuncInstOpcodeMapTy FuncInstOpcodeMap;
 
   /// A map from functions to their instructions that may read or write memory.
   FuncRWInstsMapTy FuncRWInstsMap;
+
+  /// A map from functions to their TLI.
+  FuncTLIMapTy FuncTLIMap;
 
   /// The datalayout used in the module.
   const DataLayout &DL;
@@ -307,6 +322,7 @@ struct Attributor {
   ///
   /// \param F The function that is checked for attribute opportunities.
   /// \param Whitelist If not null, a set limiting the attribute opportunities.
+  /// \param TLIGetter helper function to get TargetLibraryInfo Analysis result.
   ///
   /// Note that abstract attribute instances are generally created even if the
   /// IR already contains the information they would deduce. The most important
@@ -314,7 +330,9 @@ struct Attributor {
   /// instance, which can be queried without the need to look at the IR in
   /// various places.
   void identifyDefaultAbstractAttributes(
-      Function &F, DenseSet<const char *> *Whitelist = nullptr);
+      Function &F,
+      std::function<TargetLibraryInfo &(Function &)> &TLIGetter,
+      DenseSet<const char *> *Whitelist = nullptr);
 
   /// Check \p Pred on all function call sites.
   ///
@@ -1118,6 +1136,26 @@ struct AAAlign
   unsigned getKnownAlign() const { return getKnown(); }
 
   /// Unique ID (due to the unique address)
+  static const char ID;
+};
+
+struct AAHeapToStack : public StateWrapper<BooleanState, AbstractAttribute>,
+                       public IRPosition {
+  IRPositionConstructorForward(AAHeapToStack, IRPosition);
+
+  /// Returns true if HeapToStack conversion is assumed to be possible.
+  bool isAssumedHeapToStack() const { return getAssumed(); }
+
+  /// Returns true if HeapToStack conversion is known to be possible.
+  bool isKnownHeapToStack() const { return getKnown(); }
+
+  /// Return an IR position, see struct IRPosition.
+  ///
+  ///{
+  IRPosition &getIRPosition() { return *this; }
+  const IRPosition &getIRPosition() const { return *this; }
+  ///}
+
   static const char ID;
 };
 

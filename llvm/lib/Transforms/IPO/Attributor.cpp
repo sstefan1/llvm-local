@@ -25,6 +25,7 @@
 #include "llvm/Analysis/EHPersonalities.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/Loads.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Attributes.h"
@@ -109,6 +110,9 @@ static cl::opt<bool> VerifyAttributor(
     cl::desc("Verify the Attributor deduction and "
              "manifestation of attributes -- may issue false-positive errors"),
     cl::init(false));
+
+static cl::opt<int> MaxHeapToStackSize("max-heap-to-stack-size",
+                                       cl::init(1024), cl::Hidden);
 
 /// Logic operators for the change status enum class.
 ///
@@ -2051,6 +2055,263 @@ struct AANoReturnFunction final : AANoReturnImpl {
   }
 };
 
+struct AAHeapToStackImpl : public AAHeapToStack {
+  IRPositionConstructorForward(AAHeapToStackImpl, AAHeapToStack);
+
+  const std::string getAsStr() const override {
+    return "[H2S] Mallocs removed: " + std::to_string(MallocCalls.size()) +
+           "\n[H2S] Frees removed: " + std::to_string(FreeCalls.size());
+  }
+
+  void initialize(Attributor &A) override {
+    const Function &F = getAnchorScope();
+    if (F.hasFnAttribute(Attribute::NoFree) ||
+        F.hasFnAttribute(Attribute::NoUnwind) ||
+        !F.hasFnAttribute(Attribute::NoSync))
+      indicatePessimisticFixpoint();
+
+    const auto *TLI = A.getInfoCache().getTargetLibraryInfoForFunction(F);
+
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        if (!isMallocLikeFn(&I, TLI))
+          if (auto *CSize = dyn_cast<ConstantInt>(I.getOperand(0)))
+            if (CSize->getValue().sle(MaxHeapToStackSize)) {
+              MallocCalls.insert(const_cast<Instruction *>(&I));
+              LLVM_DEBUG(dbgs() << "H2S: Initial malloc call: " << I << "\n");
+            }
+
+        if (isFreeCall(&I, TLI)) {
+          FreeCalls.insert(const_cast<Instruction *>(&I));
+          LLVM_DEBUG(dbgs() << "H2S: Initial free call: " << I << "\n");
+        }
+      }
+
+    // No malloc calls, there is no work to be done.
+    if (MallocCalls.empty())
+      indicatePessimisticFixpoint();
+
+    SmallVector<Instruction *, 4> BadFreeCalls;
+    // Check if at leat one MallocCall has corresponding free, otherwise there
+    // is no work to be done.
+    for (auto *FreeCall : FreeCalls) {
+      SmallVector<const Value *, 4> FreeUOs;
+      GetUnderlyingObjects(FreeCall->getOperand(0), FreeUOs,
+                           A.getInfoCache().getDL());
+
+      for (auto *UO : FreeUOs) {
+        if (!isa<Instruction>(UO) ||
+            !MallocCalls.count(cast<Instruction>(UO))) {
+          BadFreeCalls.push_back(FreeCall);
+          LLVM_DEBUG(dbgs() << "H2S: Bad free call: " << *FreeCall
+                            << " UO: " << *UO << "\n");
+          break;
+        }
+
+        FreesForMalloc[const_cast<Instruction *>(cast<Instruction>(UO))]
+            .insert(FreeCall);
+      }
+    }
+
+    for (auto *BadFreeCall : BadFreeCalls)
+      FreeCalls.erase(BadFreeCall);
+
+    if (FreeCalls.empty())
+      indicatePessimisticFixpoint();
+  }
+
+  ChangeStatus manifest(Attributor &A) override {
+    assert(getState().isValidState() &&
+           "Attempted to manifest an invalid state!");
+
+    ChangeStatus HasChanged = ChangeStatus::UNCHANGED;
+    Function &F = getAnchorScope();
+
+    for (Instruction *MallocCall : MallocCalls) {
+      LLVM_DEBUG(dbgs() << "H2S: Removing malloc call: " << *MallocCall
+                        << "\n");
+
+      unsigned AS = cast<PointerType>(MallocCall->getType())->getAddressSpace();
+      Instruction *AI = new AllocaInst(Type::getInt8Ty(F.getContext()), AS,
+                                       MallocCall->getOperand(0));
+      F.begin()->getInstList().insert(F.begin()->begin(), AI);
+
+      if (AI->getType() != MallocCall->getType()) {
+        auto *BC = new BitCastInst(AI, MallocCall->getType());
+        BC->insertAfter(AI);
+        AI = BC;
+      }
+
+      MallocCall->replaceAllUsesWith(AI);
+
+      if (auto *II = dyn_cast<InvokeInst>(MallocCall)) {
+        auto *NBB = II->getNormalDest();
+        BranchInst::Create(NBB, MallocCall->getParent());
+        MallocCall->eraseFromParent();
+      } else {
+        MallocCall->eraseFromParent();
+      }
+      HasChanged = ChangeStatus::CHANGED;
+    }
+
+    for (Instruction *FreeCall : FreeCalls) {
+      LLVM_DEBUG(dbgs() << "H2S: Removing free call: " << *FreeCall << "\n");
+      FreeCall->eraseFromParent();
+      HasChanged = ChangeStatus::CHANGED;
+    }
+
+    return HasChanged;
+  }
+
+  SmallPtrSet<Instruction *, 4> MallocCalls, FreeCalls;
+
+  /// A map for each malloc call to the set of associated free calls.
+  DenseMap<Instruction *, SmallPtrSet<Instruction *, 4>> FreesForMalloc;
+
+  /// check if \p MallocCall is freed or captured in BasicBlock starting from
+  /// \p I.
+  bool checkMallocCall(Instruction *MallocCall, Instruction *I,
+                       std::set<Instruction *> &Ptrs,
+                       const TargetLibraryInfo *TLI);
+
+  /// Check if BB has unexpected exit. If pointer is not captured, it can still
+  /// be convertet to stack allocation.
+  bool checkUnexpectedExit(Instruction *I, Instruction *MallocCall,
+                           std::set<Instruction *> &Ptrs);
+
+  ChangeStatus updateImpl(Attributor &A) override {
+    Function &F = getAnchorScope();
+    SmallVector<Instruction *, 4> BadMallocCalls;
+    bool BadMalloc = true;
+
+    for (auto *MallocCall : MallocCalls) {
+      if (FreesForMalloc[MallocCall].empty()) {
+        BadMallocCalls.push_back(MallocCall);
+        LLVM_DEBUG(dbgs() << "H2S: Bad malloc call (no frees): " << *MallocCall
+                          << "\n");
+        continue;
+      }
+
+      const auto *TLI = A.getInfoCache().getTargetLibraryInfoForFunction(F);
+      std::set<Instruction *> Ptrs;
+
+      BasicBlock *CurrBB = MallocCall->getParent();
+      SmallVector<BasicBlock *, 32> WorkList;
+
+      WorkList.push_back(CurrBB);
+
+      // Check all the paths. If we find one path that doesn't free or
+      // captures the pointer, we are done.
+      while (!WorkList.empty()) {
+        BasicBlock *BB = WorkList.pop_back_val();
+
+        // Starting point
+        Instruction *I =
+            MallocCall->getParent() == BB ? MallocCall : &BB->front();
+
+        if (!checkMallocCall(MallocCall, I, Ptrs, TLI)) {
+          BadMalloc = true;
+          if (!checkUnexpectedExit(I, MallocCall, Ptrs))
+            break;
+
+          for (auto *SuccBB : successors(BB)) {
+            for (PHINode &PN : SuccBB->phis())
+              if (Ptrs.count(
+                      (Instruction *)PN.getIncomingValueForBlock(CurrBB)))
+                Ptrs.insert(&PN);
+            WorkList.push_back(SuccBB);
+          }
+          continue;
+        }
+
+        BadMalloc = false;
+        LLVM_DEBUG(dbgs() << "H2S: Malloc call OK (for a path): " << *MallocCall
+                          << "\n");
+      }
+
+      if (BadMalloc)
+        BadMallocCalls.push_back(MallocCall);
+    }
+
+    for(auto *BadMallocCall : BadMallocCalls)
+        MallocCalls.erase(BadMallocCall);
+
+    // No malloc call can be converted.
+    return MallocCalls.empty() ? ChangeStatus::UNCHANGED : ChangeStatus::CHANGED;
+  }
+};
+
+bool AAHeapToStackImpl::checkMallocCall(Instruction *MallocCall, Instruction *I,
+                                    std::set<Instruction *> &Ptrs,
+                                    const TargetLibraryInfo *TLI) {
+
+  while (I) {
+    if (isFreeCall(I, TLI) && Ptrs.count((Instruction *)I->getOperand(0))) {
+      LLVM_DEBUG(dbgs() << "H2S: Paired malloc call: " << *MallocCall
+                        << " with free at: " << *I << "\n");
+      return true;
+    }
+
+    if (auto *GEPI = dyn_cast<GetElementPtrInst>(I)) {
+      if (Ptrs.count((Instruction *)GEPI->getPointerOperand()))
+        Ptrs.insert(I);
+    } else if (I->getOpcode() == Instruction::BitCast ||
+               I->getOpcode() == Instruction::AddrSpaceCast) {
+      if (Ptrs.count((Instruction *)I->getOperand(0)))
+        Ptrs.insert(I);
+    } else if (auto CS = CallSite(&*I)) {
+      if (Ptrs.count((Instruction *)CS.getReturnedArgOperand()))
+        Ptrs.insert(I);
+    } else if (auto *SI = dyn_cast<SelectInst>(I)) {
+      if (Ptrs.count((Instruction *)SI->getTrueValue()) ||
+          Ptrs.count((Instruction *)SI->getFalseValue()))
+        Ptrs.insert(I);
+    }
+    I = I->getNextNode();
+  }
+  return false;
+}
+
+bool AAHeapToStackImpl::checkUnexpectedExit(Instruction *MallocCall,
+                                            Instruction *I,
+                                            std::set<Instruction *> &Ptrs) {
+  if (!isGuaranteedToTransferExecutionToSuccessor(I)) {
+    for (auto *Ptr : Ptrs)
+      // \p IncludeI for PointerMaybeCapturedBefore is FoundFree, because if
+      // we found free, pointer is allowed to be captured by free call.
+      //
+      // TODO: add an OBB cache to the capturing querry & provide DT.
+      if (PointerMayBeCapturedBefore(Ptr, /* ReturnCaptures */ true,
+                                     /* StoreCaptures */ true, I, nullptr,
+                                     /* IncludeI */ true)) {
+        LLVM_DEBUG(dbgs() << "H2S: Pointer: " << *Ptr
+                          << " from malloc call: " << *MallocCall
+                          << " captured before, or at, "
+                             "the potential exit at: "
+                          << *I << "\n");
+        LLVM_DEBUG(dbgs() << "H2S: Bad malloc call: " << *MallocCall
+                          << " found potential exit at: " << *I << "\n");
+        return false;
+      }
+  }
+
+  return true;
+}
+
+struct AAHeapToStackFunction final : public AAHeapToStackImpl {
+  AAHeapToStackFunction(Function &F) : AAHeapToStackImpl(F, IRP_FUNCTION) {}
+
+  /// See AbstractAttribute::trackStatistics()
+  void trackStatistics() const override {
+    STATS_DECL(MallocCalls, Function,
+               "Number of MallocCalls");
+    BUILD_STAT_NAME(MallocCalls, Function) += MallocCalls.size();
+    STATS_DECL(FreeCalls, Function,
+               "Number of FreeCalls");
+    BUILD_STAT_NAME(FreeCalls, Function) += FreeCalls.size();
+  }
+};
+
 /// ----------------------------------------------------------------------------
 ///                               Attributor
 /// ----------------------------------------------------------------------------
@@ -2349,7 +2610,11 @@ static AAType *checkAndRegisterAA(const Function &F, Attributor &A,
 }
 
 void Attributor::identifyDefaultAbstractAttributes(
-    Function &F, DenseSet<const char *> *Whitelist) {
+    Function &F,
+    std::function<TargetLibraryInfo &(Function &)> &TLIGetter,
+    DenseSet<const char *> *Whitelist) {
+
+  InfoCache.FuncTLIMap[&F] = &TLIGetter(F);
 
   // Check for dead BasicBlocks in every function.
   // We need dead instruction detection because we do not want to deal with
@@ -2371,6 +2636,9 @@ void Attributor::identifyDefaultAbstractAttributes(
 
   // Every function might be "no-return".
   checkAndRegisterAA<AANoReturnFunction>(F, *this, Whitelist, F, -1);
+
+  // Every function might be applicable for Heap-To-Stack conversion.
+  checkAndRegisterAA<AAHeapToStackFunction>(F, *this, nullptr, F, -1);
 
   // Return attributes are only appropriate if the return type is non void.
   Type *ReturnType = F.getReturnType();
@@ -2519,7 +2787,8 @@ void AbstractAttribute::print(raw_ostream &OS) const {
 ///                       Pass (Manager) Boilerplate
 /// ----------------------------------------------------------------------------
 
-static bool runAttributorOnModule(Module &M) {
+static bool runAttributorOnModule(
+    Module &M, std::function<TargetLibraryInfo &(Function &)> &TLIGetter) {
   if (DisableAttributor)
     return false;
 
@@ -2553,14 +2822,23 @@ static bool runAttributorOnModule(Module &M) {
 
     // Populate the Attributor with abstract attribute opportunities in the
     // function and the information cache with IR information.
-    A.identifyDefaultAbstractAttributes(F);
+    A.identifyDefaultAbstractAttributes(F, TLIGetter);
   }
 
   return A.run() == ChangeStatus::CHANGED;
 }
 
+
+
 PreservedAnalyses AttributorPass::run(Module &M, ModuleAnalysisManager &AM) {
-  if (runAttributorOnModule(M)) {
+  auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+
+  std::function<TargetLibraryInfo &(Function &)> TLIGetter =
+      [&](Function &F) -> TargetLibraryInfo & {
+    return FAM.getResult<TargetLibraryAnalysis>(F);
+  };
+
+  if (runAttributorOnModule(M, TLIGetter)) {
     // FIXME: Think about passes we will preserve and add them here.
     return PreservedAnalyses::none();
   }
@@ -2579,11 +2857,18 @@ struct AttributorLegacyPass : public ModulePass {
   bool runOnModule(Module &M) override {
     if (skipModule(M))
       return false;
-    return runAttributorOnModule(M);
+
+    std::function<TargetLibraryInfo &(Function &)> TLIGetter =
+        [&](Function &F) -> TargetLibraryInfo & {
+      return getAnalysis<TargetLibraryInfoWrapperPass>(F).getTLI();
+    };
+
+    return runAttributorOnModule(M, TLIGetter);
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     // FIXME: Think about passes we will preserve and add them here.
+    AU.addRequired<TargetLibraryInfoWrapperPass>();
     AU.setPreservesCFG();
   }
 };
@@ -2606,8 +2891,10 @@ const char AANoReturn::ID = 0;
 const char AAIsDead::ID = 0;
 const char AADereferenceable::ID = 0;
 const char AAAlign::ID = 0;
+const char AAHeapToStack::ID = 0;
 
 INITIALIZE_PASS_BEGIN(AttributorLegacyPass, "attributor",
                       "Deduce and propagate attributes", false, false)
+INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
 INITIALIZE_PASS_END(AttributorLegacyPass, "attributor",
                     "Deduce and propagate attributes", false, false)
