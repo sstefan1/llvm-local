@@ -1,4 +1,4 @@
-; RUN: opt -attributor --attributor-disable=false -S < %s | FileCheck %s
+; RUN: opt -passes=attributor --attributor-disable=false -enable-heap-to-stack-conversion=true -S < %s | FileCheck %s
 
 declare noalias i8* @malloc(i64)
 
@@ -8,7 +8,9 @@ declare void @func_throws(...)
 
 declare void @sync_func(i8* %p)
 
-declare void @nofree_func(i8* %p) nofree
+declare void @no_sync_func(i8* %p) nofree nosync willreturn
+
+declare void @nofree_func(i8* %p) nofree  nosync willreturn
 
 declare i32 @no_return_call() noreturn
 
@@ -19,6 +21,7 @@ declare void @free(i8* nocapture)
 define void @test1() {
   %1 = tail call noalias i8* @malloc(i64 4)
   ; CHECK: @malloc(i64 4)
+  ; CHECK-NEXT: @nocapture_func_frees_pointer(i8* %1)
   tail call void @nocapture_func_frees_pointer(i8* %1)
   tail call void (...) @func_throws()
   tail call void @free(i8* %1)
@@ -40,10 +43,11 @@ define void @test2() {
 
 define void @test3() {
   %1 = tail call noalias i8* @malloc(i64 4)
-  ; FIXME: this should be transformed to alloca.
-  tail call void @sync_func(i8* %1)
+  ; CHECK: %1 = alloca i8, i64 4
+  ; CHECK-NEXT: @no_sync_func(i8* %1)
+  tail call void @no_sync_func(i8* %1)
+  ; CHECK-NOT: @free(i8* %1)
   tail call void @free(i8* %1)
-  ; FIXME: this free should be removed.
   ret void
 }
 
@@ -51,6 +55,8 @@ define void @test3() {
 
 define void @test4() {
   %1 = tail call noalias i8* @malloc(i64 4)
+  ; CHECK: @malloc(i64 4)
+  ; CHECK-NEXT: @nofree_func(i8* %1)
   tail call void @nofree_func(i8* %1)
   ret void
 }
@@ -81,19 +87,20 @@ define void @test5(i32) {
 
 define void @test6(i32) {
   %2 = tail call noalias i8* @malloc(i64 4)
-  ; FIXME: malloc should be transformed to alloca.
+  ; CHECK: %2 = alloca i8, i64 4
+  ; CHECK-NEXT: icmp eq i32 %0, 0
   %3 = icmp eq i32 %0, 0
   br i1 %3, label %5, label %4
 
 4:                                                ; preds = %1
   tail call void @nofree_func(i8* %2)
   tail call void @free(i8* %2)
-  ; FIXME: call to free should be deleted
+  ; CHECK-NOT: @free(i8* %2)
   br label %5
 
 5:                                                ; preds = %1
   tail call void @free(i8* %2)
-  ; FIXME: call to free should be deleted
+  ; CHECK-NOT: @free(i8* %2)
   br label %6
 
 6:                                                ; preds = %5, %4
@@ -105,7 +112,7 @@ define void @test6(i32) {
 define void @test7() {
   %1 = tail call noalias i8* @malloc(i64 4)
   ; CHECK: @malloc(i64 4)
-  ; CHECK-NEXT: call i32 @no_return_call(i8* %1)
+  ; CHECK-NEXT: call i32 @no_return_call()
   tail call i32 @no_return_call()
   ; this free is dead. So malloc cannot be transformed.
   tail call void @free(i8* %1)

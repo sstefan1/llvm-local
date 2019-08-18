@@ -110,6 +110,8 @@ static cl::opt<bool> VerifyAttributor(
     cl::desc("Verify the Attributor deduction and "
              "manifestation of attributes -- may issue false-positive errors"),
     cl::init(false));
+static cl::opt<bool> EnableHeapToStack("enable-heap-to-stack-conversion",
+                                       cl::init(false), cl::Hidden);
 
 static cl::opt<int> MaxHeapToStackSize("max-heap-to-stack-size",
                                        cl::init(1024), cl::Hidden);
@@ -2059,22 +2061,22 @@ struct AAHeapToStackImpl : public AAHeapToStack {
   IRPositionConstructorForward(AAHeapToStackImpl, AAHeapToStack);
 
   const std::string getAsStr() const override {
-    return "[H2S] Mallocs removed: " + std::to_string(MallocCalls.size()) +
-           "\n[H2S] Frees removed: " + std::to_string(FreeCalls.size());
+    return "[H2S] Mallocs: " + std::to_string(MallocCalls.size()) +
+           " [H2S] Frees: " + std::to_string(FreeCalls.size());
   }
 
   void initialize(Attributor &A) override {
     const Function &F = getAnchorScope();
-    if (F.hasFnAttribute(Attribute::NoFree) ||
-        F.hasFnAttribute(Attribute::NoUnwind) ||
-        !F.hasFnAttribute(Attribute::NoSync))
+    if (F.hasFnAttribute(Attribute::NoFree)) {
       indicatePessimisticFixpoint();
+      return;
+    }
 
     const auto *TLI = A.getInfoCache().getTargetLibraryInfoForFunction(F);
 
     for (auto &BB : F)
       for (auto &I : BB) {
-        if (!isMallocLikeFn(&I, TLI))
+        if (isMallocLikeFn(&I, TLI))
           if (auto *CSize = dyn_cast<ConstantInt>(I.getOperand(0)))
             if (CSize->getValue().sle(MaxHeapToStackSize)) {
               MallocCalls.insert(const_cast<Instruction *>(&I));
@@ -2170,86 +2172,43 @@ struct AAHeapToStackImpl : public AAHeapToStack {
 
   /// check if \p MallocCall is freed or captured in BasicBlock starting from
   /// \p I.
-  bool checkMallocCall(Instruction *MallocCall, Instruction *I,
+  bool checkMallocCall(Attributor &A, Instruction *MallocCall, Instruction *I,
                        std::set<Instruction *> &Ptrs,
                        const TargetLibraryInfo *TLI);
 
   /// Check if BB has unexpected exit. If pointer is not captured, it can still
   /// be convertet to stack allocation.
-  bool checkUnexpectedExit(Instruction *I, Instruction *MallocCall,
+  bool checkUnexpectedExit(Attributor &A, Instruction *MallocCall, BasicBlock *BB,
                            std::set<Instruction *> &Ptrs);
 
-  ChangeStatus updateImpl(Attributor &A) override {
-    Function &F = getAnchorScope();
-    SmallVector<Instruction *, 4> BadMallocCalls;
-    bool BadMalloc = true;
-
-    for (auto *MallocCall : MallocCalls) {
-      if (FreesForMalloc[MallocCall].empty()) {
-        BadMallocCalls.push_back(MallocCall);
-        LLVM_DEBUG(dbgs() << "H2S: Bad malloc call (no frees): " << *MallocCall
-                          << "\n");
-        continue;
-      }
-
-      const auto *TLI = A.getInfoCache().getTargetLibraryInfoForFunction(F);
-      std::set<Instruction *> Ptrs;
-
-      BasicBlock *CurrBB = MallocCall->getParent();
-      SmallVector<BasicBlock *, 32> WorkList;
-
-      WorkList.push_back(CurrBB);
-
-      // Check all the paths. If we find one path that doesn't free or
-      // captures the pointer, we are done.
-      while (!WorkList.empty()) {
-        BasicBlock *BB = WorkList.pop_back_val();
-
-        // Starting point
-        Instruction *I =
-            MallocCall->getParent() == BB ? MallocCall : &BB->front();
-
-        if (!checkMallocCall(MallocCall, I, Ptrs, TLI)) {
-          BadMalloc = true;
-          if (!checkUnexpectedExit(I, MallocCall, Ptrs))
-            break;
-
-          for (auto *SuccBB : successors(BB)) {
-            for (PHINode &PN : SuccBB->phis())
-              if (Ptrs.count(
-                      (Instruction *)PN.getIncomingValueForBlock(CurrBB)))
-                Ptrs.insert(&PN);
-            WorkList.push_back(SuccBB);
-          }
-          continue;
-        }
-
-        BadMalloc = false;
-        LLVM_DEBUG(dbgs() << "H2S: Malloc call OK (for a path): " << *MallocCall
-                          << "\n");
-      }
-
-      if (BadMalloc)
-        BadMallocCalls.push_back(MallocCall);
-    }
-
-    for(auto *BadMallocCall : BadMallocCalls)
-        MallocCalls.erase(BadMallocCall);
-
-    // No malloc call can be converted.
-    return MallocCalls.empty() ? ChangeStatus::UNCHANGED : ChangeStatus::CHANGED;
-  }
+  ChangeStatus updateImpl(Attributor &A) override;
 };
 
-bool AAHeapToStackImpl::checkMallocCall(Instruction *MallocCall, Instruction *I,
-                                    std::set<Instruction *> &Ptrs,
-                                    const TargetLibraryInfo *TLI) {
+bool AAHeapToStackImpl::checkMallocCall(Attributor &A, Instruction *MallocCall,
+                                        Instruction *I,
+                                        std::set<Instruction *> &Ptrs,
+                                        const TargetLibraryInfo *TLI) {
+  auto *LivenessAA = A.getAAFor<AAIsDead>(*this, getAnchorScope());
 
-  while (I) {
+  do {
+    if (LivenessAA && LivenessAA->isAssumedDead(I))
+      continue;
+
     if (isFreeCall(I, TLI) && Ptrs.count((Instruction *)I->getOperand(0))) {
       LLVM_DEBUG(dbgs() << "H2S: Paired malloc call: " << *MallocCall
                         << " with free at: " << *I << "\n");
       return true;
+    }
+
+    if (ImmutableCallSite ICS = ImmutableCallSite(I)) {
+      if (!ICS.hasFnAttr(Attribute::NoSync))
+        return false;
+
+      auto *NoSyncAA = A.getAAFor<AANoSync>(*this, *I);
+
+      /// Function cannot syncronize.
+      if (NoSyncAA && !NoSyncAA->isAssumedNoSync())
+        return false;
     }
 
     if (auto *GEPI = dyn_cast<GetElementPtrInst>(I)) {
@@ -2267,35 +2226,114 @@ bool AAHeapToStackImpl::checkMallocCall(Instruction *MallocCall, Instruction *I,
           Ptrs.count((Instruction *)SI->getFalseValue()))
         Ptrs.insert(I);
     }
-    I = I->getNextNode();
-  }
+  } while ((I = I->getNextNode()));
+
   return false;
 }
 
-bool AAHeapToStackImpl::checkUnexpectedExit(Instruction *MallocCall,
-                                            Instruction *I,
+bool AAHeapToStackImpl::checkUnexpectedExit(Attributor &A, Instruction *MallocCall,
+                                            BasicBlock *BB,
                                             std::set<Instruction *> &Ptrs) {
-  if (!isGuaranteedToTransferExecutionToSuccessor(I)) {
-    for (auto *Ptr : Ptrs)
-      // \p IncludeI for PointerMaybeCapturedBefore is FoundFree, because if
-      // we found free, pointer is allowed to be captured by free call.
-      //
-      // TODO: add an OBB cache to the capturing querry & provide DT.
-      if (PointerMayBeCapturedBefore(Ptr, /* ReturnCaptures */ true,
-                                     /* StoreCaptures */ true, I, nullptr,
-                                     /* IncludeI */ true)) {
-        LLVM_DEBUG(dbgs() << "H2S: Pointer: " << *Ptr
-                          << " from malloc call: " << *MallocCall
-                          << " captured before, or at, "
-                             "the potential exit at: "
-                          << *I << "\n");
-        LLVM_DEBUG(dbgs() << "H2S: Bad malloc call: " << *MallocCall
-                          << " found potential exit at: " << *I << "\n");
+  auto *LivenessAA = A.getAAFor<AAIsDead>(*this, getAnchorScope());
+
+  for (Instruction &I : *BB) {
+    if (&I == MallocCall)
+      continue;
+
+    if (LivenessAA && LivenessAA->isAssumedDead(&I))
+      continue;
+
+    if (ImmutableCallSite ICS = ImmutableCallSite(&I)) {
+      if (!ICS.hasFnAttr(Attribute::NoSync))
         return false;
-      }
+
+      auto *NoSyncAA = A.getAAFor<AANoSync>(*this, I);
+
+      /// Function cannot syncronize.
+      if (NoSyncAA && !NoSyncAA->isAssumedNoSync())
+        return false;
+    }
+
+    if (!isGuaranteedToTransferExecutionToSuccessor(&I)) {
+      for (auto *Ptr : Ptrs)
+        // TODO: add an OBB cache to the capturing querry & provide DT.
+        if (PointerMayBeCapturedBefore(Ptr, /* ReturnCaptures */ true,
+                                       /* StoreCaptures */ true, &I, nullptr,
+                                       /* IncludeI */ true)) {
+          LLVM_DEBUG(dbgs() << "H2S: Pointer: " << *Ptr
+                            << " from malloc call: " << *MallocCall
+                            << " captured before, or at, "
+                               "the potential exit at: "
+                            << I << "\n");
+          LLVM_DEBUG(dbgs() << "H2S: Bad malloc call: " << *MallocCall
+                            << " found potential exit at: " << I << "\n");
+          return false;
+        }
+    }
   }
 
   return true;
+}
+
+ChangeStatus AAHeapToStackImpl::updateImpl(Attributor &A) {
+  Function &F = getAnchorScope();
+  SmallVector<Instruction *, 4> BadMallocCalls;
+  bool BadMalloc = true;
+
+  for (auto *MallocCall : MallocCalls) {
+    if (FreesForMalloc[MallocCall].empty()) {
+      BadMallocCalls.push_back(MallocCall);
+      LLVM_DEBUG(dbgs() << "H2S: Bad malloc call (no frees): " << *MallocCall
+                        << "\n");
+      continue;
+    }
+
+    const auto *TLI = A.getInfoCache().getTargetLibraryInfoForFunction(F);
+    std::set<Instruction *> Ptrs;
+    Ptrs.insert(MallocCall);
+
+    BasicBlock *CurrBB = MallocCall->getParent();
+    SmallVector<BasicBlock *, 32> WorkList;
+
+    WorkList.push_back(CurrBB);
+
+    // Check all the paths. If we find one path that doesn't free or an exit
+    // that captures the pointer, we are done.
+    while (!WorkList.empty()) {
+      BasicBlock *BB = WorkList.pop_back_val();
+
+      // Starting point
+      Instruction *I = MallocCall->getParent() == BB ? MallocCall->getNextNode()
+                                                     : &BB->front();
+
+      if (!checkMallocCall(A, MallocCall, I, Ptrs, TLI)) {
+        BadMalloc = true;
+        if (!checkUnexpectedExit(A, MallocCall, BB, Ptrs))
+          break;
+
+        for (auto *SuccBB : successors(BB)) {
+          for (PHINode &PN : SuccBB->phis())
+            if (Ptrs.count((Instruction *)PN.getIncomingValueForBlock(CurrBB)))
+              Ptrs.insert(&PN);
+          WorkList.push_back(SuccBB);
+        }
+        continue;
+      }
+
+      BadMalloc = false;
+    }
+
+    if (BadMalloc)
+      BadMallocCalls.push_back(MallocCall);
+  }
+
+  for (auto *BadMallocCall : BadMallocCalls) {
+    MallocCalls.erase(BadMallocCall);
+    for (auto *FreeCall : FreesForMalloc[BadMallocCall])
+      FreeCalls.erase(FreeCall);
+  }
+
+  return ChangeStatus::UNCHANGED;
 }
 
 struct AAHeapToStackFunction final : public AAHeapToStackImpl {
@@ -2614,7 +2652,10 @@ void Attributor::identifyDefaultAbstractAttributes(
     std::function<TargetLibraryInfo &(Function &)> &TLIGetter,
     DenseSet<const char *> *Whitelist) {
 
-  InfoCache.FuncTLIMap[&F] = &TLIGetter(F);
+  if (!F.isDeclaration())
+    InfoCache.FuncTLIMap[&F] = &TLIGetter(F);
+  else
+      LLVM_DEBUG(dbgs() << "DECLARATION DOESN'T HAVE TLI\n");
 
   // Check for dead BasicBlocks in every function.
   // We need dead instruction detection because we do not want to deal with
@@ -2636,9 +2677,6 @@ void Attributor::identifyDefaultAbstractAttributes(
 
   // Every function might be "no-return".
   checkAndRegisterAA<AANoReturnFunction>(F, *this, Whitelist, F, -1);
-
-  // Every function might be applicable for Heap-To-Stack conversion.
-  checkAndRegisterAA<AAHeapToStackFunction>(F, *this, nullptr, F, -1);
 
   // Return attributes are only appropriate if the return type is non void.
   Type *ReturnType = F.getReturnType();
@@ -2678,6 +2716,10 @@ void Attributor::identifyDefaultAbstractAttributes(
                                           Arg.getArgNo());
     }
   }
+
+  // Every function might be applicable for Heap-To-Stack conversion.
+  if (EnableHeapToStack)
+    checkAndRegisterAA<AAHeapToStackFunction>(F, *this, nullptr, F, -1);
 
   // Walk all instructions to find more attribute opportunities and also
   // interesting instructions that might be queried by abstract attributes
@@ -2868,6 +2910,7 @@ struct AttributorLegacyPass : public ModulePass {
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     // FIXME: Think about passes we will preserve and add them here.
+    ModulePass::getAnalysisUsage(AU);
     AU.addRequired<TargetLibraryInfoWrapperPass>();
     AU.setPreservesCFG();
   }
