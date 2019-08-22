@@ -25,6 +25,7 @@
 #include "llvm/Analysis/EHPersonalities.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/Loads.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Attributes.h"
@@ -119,6 +120,12 @@ static cl::opt<bool> VerifyAttributor(
     cl::desc("Verify the Attributor deduction and "
              "manifestation of attributes -- may issue false-positive errors"),
     cl::init(false));
+
+static cl::opt<bool> EnableHeapToStack("enable-heap-to-stack-conversion",
+                                       cl::init(false), cl::Hidden);
+
+static cl::opt<int> MaxHeapToStackSize("max-heap-to-stack-size",
+                                       cl::init(1024), cl::Hidden);
 
 /// Logic operators for the change status enum class.
 ///
@@ -2602,6 +2609,151 @@ struct AANoCaptureReturned final : AANoCaptureImpl {
 
 /// NoCapture attribute deduction for a call site return value.
 using AANoCaptureCallSiteReturned = AANoCaptureFloating;
+
+/// ----------------------- Heap-To-Stack Conversion ---------------------------
+struct AAHeapToStackImpl : public AAHeapToStack {
+  AAHeapToStackImpl(const IRPosition &IRP) : AAHeapToStack(IRP) {}
+
+  void initialize(Attributor &A) override {
+    const Function *F = getAssociatedFunction();
+    const auto *TLI = A.getInfoCache().getTargetLibraryInfoForFunction(*F);
+
+    auto MallocCheck = [&](Instruction &I) {
+      if (isMallocLikeFn(&I, TLI))
+        if (auto *CSize = dyn_cast<ConstantInt>(I.getOperand(0)))
+          if (CSize->getValue().sle(MaxHeapToStackSize)) {
+            MallocCalls.insert(const_cast<Instruction *>(&I));
+            LLVM_DEBUG(dbgs() << "H2S: Initial malloc call: " << I << "\n");
+          }
+      return true;
+    };
+
+    // Get all malloc calls from this function.
+    A.checkForAllCallLikeInstructions(MallocCheck, *this);
+
+    // No malloc calls, there is no work to be done.
+    if (MallocCalls.empty())
+      indicatePessimisticFixpoint();
+  }
+
+  ChangeStatus manifest(Attributor &A) override {
+    assert(getState().isValidState() &&
+           "Attempted to manifest an invalid state!");
+
+    ChangeStatus HasChanged = ChangeStatus::UNCHANGED;
+    Function *F = getAssociatedFunction();
+
+    for (const Instruction *Malloc : MallocCalls) {
+      Instruction *MallocCall = const_cast<Instruction *>(Malloc);
+      // This malloc cannot be replaced.
+      if (BadMallocCalls.count(MallocCall))
+        continue;
+
+      for (Instruction *FreeCall : FreesForMalloc[MallocCall]) {
+        LLVM_DEBUG(dbgs() << "H2S: Removing free call: " << *FreeCall << "\n");
+        FreeCall->eraseFromParent();
+        HasChanged = ChangeStatus::CHANGED;
+      }
+
+      LLVM_DEBUG(dbgs() << "H2S: Removing malloc call: " << *MallocCall
+                        << "\n");
+
+      unsigned AS = cast<PointerType>(MallocCall->getType())->getAddressSpace();
+      Instruction *AI = new AllocaInst(Type::getInt8Ty(F->getContext()), AS,
+                                       MallocCall->getOperand(0));
+      F->begin()->getInstList().insert(F->begin()->begin(), AI);
+
+      if (AI->getType() != MallocCall->getType()) {
+        auto *BC = new BitCastInst(AI, MallocCall->getType());
+        BC->insertAfter(AI);
+        AI = BC;
+      }
+
+      MallocCall->replaceAllUsesWith(AI);
+
+      if (auto *II = dyn_cast<InvokeInst>(MallocCall)) {
+        auto *NBB = II->getNormalDest();
+        BranchInst::Create(NBB, MallocCall->getParent());
+        MallocCall->eraseFromParent();
+      } else {
+        MallocCall->eraseFromParent();
+      }
+      HasChanged = ChangeStatus::CHANGED;
+    }
+
+    return HasChanged;
+  }
+
+  /// Collection of all malloc calls in a function.
+  SmallSetVector<const Instruction *, 4> MallocCalls;
+
+  /// Collection of malloc calls that cannot be converted.
+  DenseSet<const Instruction *> BadMallocCalls;
+
+  /// A map for each malloc call to the set of associated free calls.
+  DenseMap<Instruction *, SmallPtrSet<Instruction *, 4>> FreesForMalloc;
+
+  ChangeStatus updateImpl(Attributor &A) override;
+};
+
+ChangeStatus AAHeapToStackImpl::updateImpl(Attributor &A) {
+  const Function *F = getAssociatedFunction();
+  const auto *TLI = A.getInfoCache().getTargetLibraryInfoForFunction(*F);
+
+  auto CallCheck = [&](Instruction &I) {
+    for (const Instruction *MallocCall : MallocCalls) {
+      if (isFreeCall(&I, TLI)) {
+        if (auto *Ptr = dyn_cast<Instruction>(I.getOperand(0)))
+          if (Ptr == MallocCall) {
+            FreesForMalloc[const_cast<Instruction *>(MallocCall)].insert(&I);
+            return true;
+          }
+        continue;
+      }
+
+      CallSite CS(&I);
+
+      Function *CalledFunction = CS.getCalledFunction();
+      const IRPosition &IRPos = IRPosition::value(*CalledFunction);
+      auto NoFreeAA = A.getAAFor<AANoFree>(*this, IRPos);
+
+      for (Argument &Arg : CalledFunction->args()) {
+        if (dyn_cast<Instruction>(&Arg) != MallocCall)
+          continue;
+
+        BadMallocCalls.insert(MallocCall);
+        const IRPosition &IPos = IRPosition::value(Arg);
+        auto NoCaptureAA = A.getAAFor<AANoCapture>(*this, IPos);
+
+        // If a function does not capture the pointer we are fine.
+        if(NoCaptureAA.isAssumedNoCapture())
+          return true;
+        // If a function does not free memory we are fine
+        // Note: Right now, if a function that has malloc pointer as an argument
+        // frees memory, we assume that the malloc pointer is freed.
+        //
+        // TODO: Add nofree callsite argument attribute to indicate that pointer
+        // argument is not freed.
+        if (NoFreeAA.isAssumedNoFree())
+          return true;
+
+        // Remove all Frees that we thought we could remove.
+        FreesForMalloc.erase(Malloc);
+        BadMallocCalls.insert(MallocCall);
+        return false;
+      }
+    }
+  };
+
+  size_t NumBadMallocs = BadMallocCalls.size();
+
+  A.checkForAllCallLikeInstructions(CallCheck, *this);
+
+  if (NumBadMallocs != BadMallocCalls.size())
+    return ChangeStatus::CHANGED;
+
+  return ChangeStatus::UNCHANGED;
+}
 
 /// ----------------------------------------------------------------------------
 ///                               Attributor
