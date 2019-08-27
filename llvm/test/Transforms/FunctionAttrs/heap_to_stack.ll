@@ -8,9 +8,13 @@ declare void @func_throws(...)
 
 declare void @sync_func(i8* %p)
 
+declare void @sync_will_return(i8* %p) willreturn
+
 declare void @no_sync_func(i8* %p) nofree nosync willreturn
 
 declare void @nofree_func(i8* %p) nofree  nosync willreturn
+
+declare void @foo(i32* %p)
 
 declare i32 @no_return_call() noreturn
 
@@ -111,10 +115,54 @@ define void @test6(i32) {
 
 define void @test7() {
   %1 = tail call noalias i8* @malloc(i64 4)
-  ; CHECK: @malloc(i64 4)
+  ; CHECK: @alloca(i64 4)
   ; CHECK-NEXT: call i32 @no_return_call()
   tail call i32 @no_return_call()
   ; this free is dead. So malloc cannot be transformed.
+  ; CHECK-NOT: @free(i8* %1)
+  tail call void @free(i8* %1)
+  ret void
+}
+
+; TEST 8 - Negative: bitcast pointer used in capture function
+
+define void @test8() {
+  %1 = tail call noalias i8* @malloc(i64 4)
+  ; CHECK: %1 = tail call noalias i8* malloc (i64 4)
+  ; CHECK-NEXT: @no_sync_func(i8* %1)
+  tail call void @no_sync_func(i8* %1)
+  %2 = bitcast i8* %1 to i32*
+  store i32 10, i32* %2
+  %3 = load i32, i32* %2
+  tail call void @foo(i32* %2)
+  ; CHECK: @free(i8* %1)
+  tail call void @free(i8* %1)
+  ret void
+}
+
+; TEST 9 - 1 malloc, 1 free
+
+define i32 @test9() {
+  %1 = tail call noalias i8* @malloc(i64 4)
+  ; CHECK: %1 = alloca i8, i64 4
+  ; CHECK-NEXT: @no_sync_func(i8* %1)
+  tail call void @no_sync_func(i8* %1)
+  %2 = bitcast i8* %1 to i32*
+  store i32 10, i32* %2
+  %3 = load i32, i32* %2
+  ; CHECK-NOT: @free(i8* %1)
+  tail call void @free(i8* %1)
+  ret i32 %3
+}
+
+; TEST 10 
+; FIXME: should be ok
+
+define void @test10() {
+  %1 = tail call noalias i8* @malloc(i64 4)
+  ; CHECK: @malloc(i64 4)
+  ; CHECK-NEXT: @sync_func(i8* %1)
+  tail call void @sync_will_return(i8* %1)
   tail call void @free(i8* %1)
   ret void
 }
