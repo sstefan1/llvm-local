@@ -2618,6 +2618,28 @@ struct AAHeapToStackImpl : public AAHeapToStack {
     return "[H2S] Mallocs: " + std::to_string(MallocCalls.size());
   }
 
+  void initialize(Attributor &A) override {
+    const Function *F = getAssociatedFunction();
+    const auto *TLI = A.getInfoCache().getTargetLibraryInfoForFunction(*F);
+
+    auto MallocCheck = [&](Instruction &I) {
+      if (isMallocLikeFn(&I, TLI))
+        if (auto *CSize = dyn_cast<ConstantInt>(I.getOperand(0)))
+          if (CSize->getValue().sle(MaxHeapToStackSize)) {
+            MallocCalls.insert(const_cast<Instruction *>(&I));
+            LLVM_DEBUG(dbgs() << "H2S: Initial malloc call: " << I << "\n");
+          }
+      return true;
+    };
+
+    // Get all malloc calls from this function.
+    A.checkForAllCallLikeInstructions(MallocCheck, *this);
+
+    // No malloc calls, there is no work to be done.
+    if (MallocCalls.empty())
+      indicatePessimisticFixpoint();
+  }
+
   ChangeStatus manifest(Attributor &A) override {
     assert(getState().isValidState() &&
            "Attempted to manifest an invalid state!");
@@ -2682,81 +2704,61 @@ ChangeStatus AAHeapToStackImpl::updateImpl(Attributor &A) {
   const Function *F = getAssociatedFunction();
   const auto *TLI = A.getInfoCache().getTargetLibraryInfoForFunction(*F);
 
-  auto UsesCheck = [&](Instruction &I) {
-    SmallPtrSet<const Use *, 8> Visited;
-    SmallVector<const Use *, 8> Worklist;
-
-    for (Use &U : I.uses())
-      Worklist.push_back(const_cast<Use *>(&U));
-
-    while (!Worklist.empty()) {
-      const Use *U = Worklist.pop_back_val();
-      if (!Visited.insert(U).second)
+  auto CallCheck = [&](Instruction &I) {
+    for (const Instruction *MallocCall : MallocCalls) {
+      if (MallocCall == &I)
         continue;
 
-      const auto *UserI = U->getUser();
-
-      if (isa<LoadInst>(UserI) || isa<StoreInst>(UserI))
-        continue;
-
-      // NOTE: Right now, if a function that has malloc pointer as an argument
-      // frees memory, we assume that the malloc pointer is freed.
-      if (auto *CB = dyn_cast<CallBase>(UserI)) {
-        // Record malloc.
-        if (isFreeCall(UserI, TLI)) {
-          FreesForMalloc[&I].insert(
-              cast<Instruction>(const_cast<User *>(UserI)));
-          continue;
+      if (isFreeCall(&I, TLI)) {
+        if (auto *Ptr = dyn_cast<Instruction>(I.getOperand(0)))
+          if (Ptr == MallocCall) {
+            if (auto *Ptr = dyn_cast<Instruction>(I.getOperand(0)))
+              FreesForMalloc[const_cast<Instruction *>(MallocCall)].insert(&I);
+            return true;
         }
+        continue;
+      }
 
+      CallSite ICS(&I);
+
+      Function *CalledFunction = ICS.getCalledFunction();
+      const auto &NoFreeAA =
+          A.getAAFor<AANoFree>(*this, IRPosition::callsite_function(ICS));
+
+      for (Argument &Arg : CalledFunction->args()) {
+        if (dyn_cast<Instruction>(&Arg) != MallocCall)
+          continue;
+
+        BadMallocCalls.insert(MallocCall);
+        const IRPosition &IRPos = IRPosition::value(Arg);
+        const auto &NoCaptureAA = A.getAAFor<AANoCapture>(*this, IRPos);
+
+        // If a function does not capture the pointer we are fine.
+        if(NoCaptureAA.isAssumedNoCapture())
+          return true;
         // If a function does not free memory we are fine
-        const auto &NoFreeAA =
-            A.getAAFor<AANoFree>(*this, IRPosition::callsite_function(*CB));
-        if (!NoFreeAA.isAssumedNoFree())
-          return false;
-
+        // Note: Right now, if a function that has malloc pointer as an argument
+        // frees memory, we assume that the malloc pointer is freed.
+        //
         // TODO: Add nofree callsite argument attribute to indicate that pointer
         // argument is not freed.
-        if (auto *Arg = dyn_cast<Argument>(U)) {
-          const auto &NoCaptureAA = A.getAAFor<AANoCapture>(
-              *this, IRPosition::callsite_argument(*CB, Arg->getArgNo()));
+        if (NoFreeAA.isAssumedNoFree())
+          return true;
 
-          if (NoCaptureAA.isAssumedNoCapture())
-            return false;
-        }
-        continue;
+        // Remove all Frees that we thought we could remove.
+        FreesForMalloc.erase(const_cast<Instruction *>(MallocCall));
+        BadMallocCalls.insert(MallocCall);
+        return false;
       }
-      if (isa<GetElementPtrInst>(UserI) || isa<BitCastInst>(UserI)) {
-        for (Use &U : const_cast<User *>(UserI)->uses())
-          Worklist.push_back(&U);
-        continue;
-      }
-      // Unknown user.
-      return false;
     }
     return true;
-  };
 
-  auto MallocCheck = [&](Instruction &I) {
-    if (!isMallocLikeFn(&I, TLI))
-      return true;
-    if (BadMallocCalls.count(&I))
-      return true;
-
-    if (UsesCheck(I))
-      MallocCalls.insert(&I);
-    else {
-      BadMallocCalls.insert(&I);
-      FreesForMalloc.erase(const_cast<Instruction *>(&I));
-    }
-    return true;
   };
-  
   size_t NumBadMallocs = BadMallocCalls.size();
 
-  A.checkForAllCallLikeInstructions(MallocCheck, *this);
-
+  A.checkForAllCallLikeInstructions(CallCheck, *this);
   if (NumBadMallocs != BadMallocCalls.size())
+
     return ChangeStatus::CHANGED;
 
   return ChangeStatus::UNCHANGED;
@@ -3188,11 +3190,11 @@ void Attributor::identifyDefaultAbstractAttributes(
       // Every argument with pointer type might be marked dereferenceable.
       checkAndRegisterAA<AADereferenceableArgument>(ArgPos, *this, Whitelist);
 
-      // Every argument with pointer type might be marked nocapture.
-      checkAndRegisterAA<AANoCaptureArgument>(ArgPos, *this, Whitelist);
-
       // Every argument with pointer type might be marked align.
       checkAndRegisterAA<AAAlignArgument>(ArgPos, *this, Whitelist);
+
+      // Every argument with pointer type might be marked nocapture.
+      checkAndRegisterAA<AANoCaptureArgument>(ArgPos, *this, Whitelist);
     }
   }
 
