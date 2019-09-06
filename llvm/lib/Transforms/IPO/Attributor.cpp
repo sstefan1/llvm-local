@@ -2759,9 +2759,6 @@ ChangeStatus AAHeapToStackImpl::updateImpl(Attributor &A) {
         continue;
       }
 
-      if (isa<PHINode>(UserI))
-        continue;
-
       // Unknown user.
       LLVM_DEBUG(dbgs() << "[H2S] Unknown user: " << *UserI << "\n");
       return false;
