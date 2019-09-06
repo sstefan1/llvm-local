@@ -122,10 +122,10 @@ static cl::opt<bool> VerifyAttributor(
     cl::init(false));
 
 static cl::opt<bool> EnableHeapToStack("enable-heap-to-stack-conversion",
-                                       cl::init(false), cl::Hidden);
+                                       cl::init(true), cl::Hidden);
 
 static cl::opt<int> MaxHeapToStackSize("max-heap-to-stack-size",
-                                       cl::init(1024), cl::Hidden);
+                                       cl::init(128), cl::Hidden);
 
 /// Logic operators for the change status enum class.
 ///
@@ -2624,9 +2624,9 @@ struct AAHeapToStackImpl : public AAHeapToStack {
 
     ChangeStatus HasChanged = ChangeStatus::UNCHANGED;
     Function *F = getAssociatedFunction();
+    const auto *TLI = A.getInfoCache().getTargetLibraryInfoForFunction(*F);
 
-    for (const Instruction *Malloc : MallocCalls) {
-      Instruction *MallocCall = const_cast<Instruction *>(Malloc);
+    for (Instruction *MallocCall : MallocCalls) {
       // This malloc cannot be replaced.
       if (BadMallocCalls.count(MallocCall))
         continue;
@@ -2641,27 +2641,49 @@ struct AAHeapToStackImpl : public AAHeapToStack {
       LLVM_DEBUG(dbgs() << "H2S: Removing malloc call: " << *MallocCall
                         << "\n");
 
-      unsigned AS = cast<PointerType>(MallocCall->getType())->getAddressSpace();
-      Instruction *AI = new AllocaInst(Type::getInt8Ty(F->getContext()), AS,
-                                       MallocCall->getOperand(0));
-      F->begin()->getInstList().insert(F->begin()->begin(), AI);
-
-      if (AI->getType() != MallocCall->getType()) {
-        auto *BC = new BitCastInst(AI, MallocCall->getType());
-        BC->insertAfter(AI);
-        AI = BC;
+      Constant *Size;
+      if (isCallocLikeFn(MallocCall, TLI)) {
+        auto *Num = cast<ConstantInt>(MallocCall->getOperand(0));
+        auto *SizeT = dyn_cast<ConstantInt>(MallocCall->getOperand(1));
+        APInt TotalSize = SizeT->getValue() * Num->getValue();
+        Size =
+            ConstantInt::get(MallocCall->getOperand(0)->getType(), TotalSize);
+      } else {
+        Size = cast<ConstantInt>(MallocCall->getOperand(0));
       }
+
+        unsigned AS =
+            cast<PointerType>(MallocCall->getType())->getAddressSpace();
+        Instruction *AI = new AllocaInst(Type::getInt8Ty(F->getContext()), AS,
+                                         Size, "", MallocCall->getNextNode());
+        // F->begin()->getInstList().insert(F->begin()->begin(), AI);
+
+        if (AI->getType() != MallocCall->getType()) {
+          AI = new BitCastInst(AI, MallocCall->getType(), "malloc_bc",
+                               AI->getNextNode());
+        }
 
       MallocCall->replaceAllUsesWith(AI);
 
       if (auto *II = dyn_cast<InvokeInst>(MallocCall)) {
         auto *NBB = II->getNormalDest();
         BranchInst::Create(NBB, MallocCall->getParent());
-        // MallocCall->eraseFromParent();
         A.deleteAfterManifest(*MallocCall);
       } else {
         A.deleteAfterManifest(*MallocCall);
-        // MallocCall->eraseFromParent();
+      }
+
+      if (isCallocLikeFn(MallocCall, TLI)) {
+        auto *BI = new BitCastInst(AI, MallocCall->getType(), "calloc_bc",
+                                   AI->getNextNode());
+        Value *Ops[] = {
+            BI, ConstantInt::get(F->getContext(), APInt(8, 0, false)), Size,
+            ConstantInt::get(Type::getInt1Ty(F->getContext()), false)};
+
+        Type *Tys[] = {BI->getType(), MallocCall->getOperand(0)->getType()};
+        Module *M = F->getParent();
+        Function *Fn = Intrinsic::getDeclaration(M, Intrinsic::memset, Tys);
+        CallInst::Create(Fn, Ops, "", BI->getNextNode());
       }
       HasChanged = ChangeStatus::CHANGED;
     }
@@ -2670,7 +2692,7 @@ struct AAHeapToStackImpl : public AAHeapToStack {
   }
 
   /// Collection of all malloc calls in a function.
-  SmallSetVector<const Instruction *, 4> MallocCalls;
+  SmallSetVector<Instruction *, 4> MallocCalls;
 
   /// Collection of malloc calls that cannot be converted.
   DenseSet<const Instruction *> BadMallocCalls;
@@ -2716,20 +2738,18 @@ ChangeStatus AAHeapToStackImpl::updateImpl(Attributor &A) {
         // If a function does not free memory we are fine
         const auto &NoFreeAA =
             A.getAAFor<AANoFree>(*this, IRPosition::callsite_function(*CB));
-        if (NoFreeAA.isAssumedNoFree())
-          continue;
 
         // TODO: Add nofree callsite argument attribute to indicate that pointer
         // argument is not freed.
-        if(CB->isArgOperand(U)){
-          unsigned ArgNo = U - CB->arg_begin();
-          const auto &NoCaptureAA = A.getAAFor<AANoCapture>(
-              *this, IRPosition::callsite_argument(*CB, ArgNo));
+        if (!CB->isArgOperand(U))
+          continue;
+        unsigned ArgNo = U - CB->arg_begin();
+        const auto &NoCaptureAA = A.getAAFor<AANoCapture>(
+            *this, IRPosition::callsite_argument(*CB, ArgNo));
 
-          if (!NoCaptureAA.isAssumedNoCapture()) {
-            LLVM_DEBUG(dbgs() << "[H2S] Bad user: " << *UserI << "\n");
-            return false;
-          }
+        if (!NoCaptureAA.isAssumedNoCapture() || !NoFreeAA.isAssumedNoFree()) {
+          LLVM_DEBUG(dbgs() << "[H2S] Bad user: " << *UserI << "\n");
+          return false;
         }
         continue;
       }
@@ -2739,6 +2759,9 @@ ChangeStatus AAHeapToStackImpl::updateImpl(Attributor &A) {
         continue;
       }
 
+      if (isa<PHINode>(UserI))
+        continue;
+
       // Unknown user.
       LLVM_DEBUG(dbgs() << "[H2S] Unknown user: " << *UserI << "\n");
       return false;
@@ -2746,9 +2769,20 @@ ChangeStatus AAHeapToStackImpl::updateImpl(Attributor &A) {
     return true;
   };
 
-  auto MallocCheck = [&](Instruction &I) {
-    if (!isMallocLikeFn(&I, TLI))
+  auto MallocCallocCheck = [&](Instruction &I) {
+    if (isMallocLikeFn(&I, TLI)) {
+      if (auto *Size = dyn_cast<ConstantInt>(I.getOperand(0)))
+        if (!Size->getValue().sle(MaxHeapToStackSize))
+          return true;
+    } else if (isCallocLikeFn(&I, TLI)) {
+      if (auto *Num = dyn_cast<ConstantInt>(I.getOperand(0)))
+        if (auto *Size = dyn_cast<ConstantInt>(I.getOperand(1)))
+          if (!(Size->getValue() * Num->getValue()).sle(MaxHeapToStackSize))
+            return true;
+    } else
       return true;
+    
+
     if (BadMallocCalls.count(&I))
       return true;
 
@@ -2756,19 +2790,17 @@ ChangeStatus AAHeapToStackImpl::updateImpl(Attributor &A) {
       MallocCalls.insert(&I);
     else
       BadMallocCalls.insert(&I);
-
     return true;
   };
-  
+
   size_t NumBadMallocs = BadMallocCalls.size();
 
-  A.checkForAllCallLikeInstructions(MallocCheck, *this);
+  A.checkForAllCallLikeInstructions(MallocCallocCheck, *this);
 
   if (NumBadMallocs != BadMallocCalls.size())
     return ChangeStatus::CHANGED;
 
   return ChangeStatus::UNCHANGED;
-
 }
 
 struct AAHeapToStackFunction final : public AAHeapToStackImpl {
