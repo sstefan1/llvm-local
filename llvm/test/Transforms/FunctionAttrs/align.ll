@@ -8,26 +8,26 @@ target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
 
 
 ; TEST 1
-; ATTRIBUTOR: define align 8 i32* @test1(i32* readnone returned align 8 "no-capture-maybe-returned" %0)
+; ATTRIBUTOR: define align 8 i32* @test1(i32* nofree readnone returned align 8 "no-capture-maybe-returned" %0)
 define i32* @test1(i32* align 8 %0) #0 {
   ret i32* %0
 }
 
 ; TEST 2
-; ATTRIBUTOR: define i32* @test2(i32* readnone returned "no-capture-maybe-returned" %0)
+; ATTRIBUTOR: define i32* @test2(i32* nofree readnone returned "no-capture-maybe-returned" %0)
 define i32* @test2(i32* %0) #0 {
   ret i32* %0
 }
 
 ; TEST 3
-; ATTRIBUTOR: define align 4 i32* @test3(i32* readnone align 8 "no-capture-maybe-returned" %0, i32* readnone align 4 "no-capture-maybe-returned" %1, i1 %2)
+; ATTRIBUTOR: define align 4 i32* @test3(i32* nofree readnone align 8 "no-capture-maybe-returned" %0, i32* readnone align 4 "no-capture-maybe-returned" %1, i1 %2)
 define i32* @test3(i32* align 8 %0, i32* align 4 %1, i1 %2) #0 {
   %ret = select i1 %2, i32* %0, i32* %1
   ret i32* %ret
 }
 
 ; TEST 4
-; ATTRIBUTOR: define align 32 i32* @test4(i32* readnone align 32 "no-capture-maybe-returned" %0, i32* readnone align 32 "no-capture-maybe-returned" %1, i1 %2)
+; ATTRIBUTOR: define align 32 i32* @test4(i32* nofree readnone align 32 "no-capture-maybe-returned" %0, i32* readnone align 32 "no-capture-maybe-returned" %1, i1 %2)
 define i32* @test4(i32* align 32 %0, i32* align 32 %1, i1 %2) #0 {
   %ret = select i1 %2, i32* %0, i32* %1
   ret i32* %ret
@@ -134,7 +134,7 @@ define internal i8* @f3(i8* readnone %0) local_unnamed_addr #0 {
 ; Better than IR information
 define align 4 i32* @test7(i32* align 32 %p) #0 {
 ; ATTRIBUTOR-LABEL: define {{[^@]+}}@test7
-; ATTRIBUTOR-SAME: (i32* readnone returned align 32 "no-capture-maybe-returned" [[P:%.*]])
+; ATTRIBUTOR-SAME: (i32* nofree readnone returned align 32 "no-capture-maybe-returned" [[P:%.*]])
 ; ATTRIBUTOR-NEXT:    ret i32* [[P:%.*]]
 ;
   tail call i8* @f1(i8* align 8 dereferenceable(1) @a1)
