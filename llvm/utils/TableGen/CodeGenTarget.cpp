@@ -25,6 +25,7 @@
 #include "llvm/TableGen/Record.h"
 #include "llvm/TableGen/TableGenBackend.h"
 #include <algorithm>
+
 using namespace llvm;
 
 cl::OptionCategory AsmParserCat("Options for -gen-asm-parser");
@@ -609,12 +610,17 @@ CodeGenIntrinsic::CodeGenIntrinsic(Record *R) {
   isCommutative = false;
   canThrow = false;
   isNoReturn = false;
-  isWillReturn = false;
   isCold = false;
   isNoDuplicate = false;
   isConvergent = false;
   isSpeculatable = false;
   hasSideEffects = false;
+
+  // Default IntrProperties. Will be set to false if present in
+  // OptOutIntrProperties.
+  isNoSync = true;
+  isNoFree = true;
+  isWillReturn = true;
 
   if (DefName.size() <= 4 ||
       std::string(DefName.begin(), DefName.begin() + 4) != "int_")
@@ -744,6 +750,23 @@ CodeGenIntrinsic::CodeGenIntrinsic(Record *R) {
     IS.ParamTypeDefs.push_back(TyEl);
   }
 
+  // Parse the opt-out intrinsic properties.
+  ListInit *OptOutPropList = R->getValueAsListInit("OptOutIntrProperties");
+  for (unsigned i = 0, e = OptOutPropList->size(); i != e; ++i) {
+    Record *Property = OptOutPropList->getElementAsRecord(i);
+    assert(Property->isSubClassOf("IntrinsicProperty") &&
+           "Expected a property");
+
+    if (Property->getName() == "IntrWillReturn")
+      isWillReturn = false;
+    else if (Property->getName() == "IntrNoSync")
+      isNoSync = false;
+    else if (Property->getName() == "IntrNoFree")
+      isNoFree = false;
+    else
+      llvm_unreachable("Unknown property!");
+  }
+
   // Parse the intrinsic properties.
   ListInit *PropList = R->getValueAsListInit("IntrProperties");
   for (unsigned i = 0, e = PropList->size(); i != e; ++i) {
@@ -774,8 +797,6 @@ CodeGenIntrinsic::CodeGenIntrinsic(Record *R) {
       isConvergent = true;
     else if (Property->getName() == "IntrNoReturn")
       isNoReturn = true;
-    else if (Property->getName() == "IntrWillReturn")
-      isWillReturn = true;
     else if (Property->getName() == "IntrCold")
       isCold = true;
     else if (Property->getName() == "IntrSpeculatable")
