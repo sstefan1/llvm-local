@@ -56,6 +56,8 @@ define void @test2() {
 
 ; TEST 3 - 1 malloc, 1 free
 
+; CHECK: Function Attrs: nofree nosync willreturn
+; CHECK-NEXT: define void @test3
 define void @test3() {
   %1 = tail call noalias i8* @malloc(i64 4)
   ; CHECK: %1 = alloca i8, i64 4
@@ -78,6 +80,8 @@ define void @test3a(i8* %p) {
 
 declare noalias i8* @calloc(i64, i64)
 
+; CHECK: Function Attrs: nofree nosync willreturn
+; CHECK-NEXT: define void @test0
 define void @test0() {
   %1 = tail call noalias i8* @calloc(i64 2, i64 4)
   ; CHECK: %1 = alloca i8, i64 8
@@ -90,7 +94,10 @@ define void @test0() {
   ret void
 }
 
-; TEST 4 
+; TEST 4
+
+; CHECK: Function Attrs: nofree nosync willreturn
+; CHECK-NEXT: define void @test4
 define void @test4() {
   %1 = tail call noalias i8* @malloc(i64 4)
   ; CHECK: %1 = alloca i8, i64 4
@@ -125,6 +132,8 @@ define void @test5(i32, i8* %p) {
 
 ; TEST 6 - all exit paths have a call to free
 
+; CHECK: Function Attrs: nofree nosync
+; CHECK-NEXT: define void @test6
 define void @test6(i32) {
   %2 = tail call noalias i8* @malloc(i64 4)
   ; CHECK: %2 = alloca i8, i64 4
@@ -192,6 +201,8 @@ define void @test9() {
 
 ; TEST 10 - 1 malloc, 1 free
 
+; CHECK: Function Attrs: nofree nosync willreturn
+; CHECK-NEXT: define i32 @test10
 define i32 @test10() {
   %1 = tail call noalias i8* @malloc(i64 4)
   ; CHECK: %1 = alloca i8, i64 4
@@ -205,6 +216,8 @@ define i32 @test10() {
   ret i32 %3
 }
 
+; CHECK: Function Attrs: willreturn
+; CHECK-NEXT: define i32 @test_lifetime
 define i32 @test_lifetime() {
   %1 = tail call noalias i8* @malloc(i64 4)
   ; CHECK: %1 = alloca i8, i64 4
@@ -219,11 +232,12 @@ define i32 @test_lifetime() {
   ret i32 %3
 }
 
-; TEST 11 
+; TEST 11
 
+; CHECK: Function Attrs: nounwind willreturn
+; CHECK-NEXT: define void @test11
 define void @test11() {
   %1 = tail call noalias i8* @malloc(i64 4)
-  ; CHECK: test11
   ; CHECK-NEXT: alloc
   ; CHECK-NEXT: @sync_will_return(i8* %1)
   tail call void @sync_will_return(i8* %1)
@@ -232,6 +246,9 @@ define void @test11() {
 }
 
 ; TEST 12
+
+; CHECK: Function Attrs: nofree nosync nounwind
+; CHECK-NEXT: define i32 @irreducible_cfg
 define i32 @irreducible_cfg(i32 %0) {
   ; CHECK: alloca i8, i64 4
   ; CHECK-NEXT: %3 = bitcast
@@ -273,6 +290,8 @@ define i32 @irreducible_cfg(i32 %0) {
 }
 
 
+; CHECK: Function Attrs: nofree nosync nounwind
+; CHECK-NEXT: define i32 @malloc_in_loop
 define i32 @malloc_in_loop(i32 %0) {
   %2 = alloca i32, align 4
   %3 = alloca i32*, align 8
@@ -357,6 +376,8 @@ define void @test15(i64 %S) {
   ret void
 }
 
+; CHECK: Function Attrs: nofree nosync willreturn
+; CHECK-NEXT: define void @test16a
 define void @test16a(i8 %v, i8** %P) {
   ; CHECK: %1 = alloca
   %1 = tail call noalias i8* @malloc(i64 4)
@@ -381,6 +402,8 @@ define void @test16b(i8 %v, i8** %P) {
   ret void
 }
 
+; CHECK: Function Attrs: nofree nosync nounwind willreturn
+; CHECK-NEXT: define void @test16c
 define void @test16c(i8 %v, i8** %P) {
   ; CHECK: %1 = alloca
   %1 = tail call noalias i8* @malloc(i64 4)

@@ -2459,6 +2459,9 @@ struct AAHeapToStack : public StateWrapper<BooleanState, AbstractAttribute>,
   /// Returns true if HeapToStack conversion is known to be possible.
   bool isKnownHeapToStack() const { return getKnown(); }
 
+  /// Returns true if instruction (malloc/free) is identified for deletion.
+  virtual bool isAssumedToBeDeleted(Attributor &A, Instruction *I) const;
+
   /// Return an IR position, see struct IRPosition.
   const IRPosition &getIRPosition() const { return *this; }
 

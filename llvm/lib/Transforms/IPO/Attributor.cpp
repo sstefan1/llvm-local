@@ -1687,11 +1687,13 @@ struct AANoFreeImpl : public AANoFree {
   ChangeStatus updateImpl(Attributor &A) override {
     auto CheckForNoFree = [&](Instruction &I) {
       ImmutableCallSite ICS(&I);
+
       if (ICS.hasFnAttr(Attribute::NoFree))
         return true;
 
       const auto &NoFreeAA =
           A.getAAFor<AANoFree>(*this, IRPosition::callsite_function(ICS));
+
       return NoFreeAA.isAssumedNoFree();
     };
 
@@ -2904,6 +2906,14 @@ struct AAIsDeadFloating : public AAIsDeadValueImpl {
   ChangeStatus manifest(Attributor &A) override {
     Value &V = getAssociatedValue();
     if (auto *I = dyn_cast<Instruction>(&V)) {
+      const auto *TLI = A.getInfoCache().getTargetLibraryInfoForFunction(
+          *(I->getParent()->getParent()));
+
+      // These are Mallocs/Frees that are marked for deletion by H2S.
+      // No need to delete them after manifest (already deleted by H2S).
+      if (isMallocOrCallocLikeFn(I, TLI))
+        return ChangeStatus::CHANGED;
+
       // If we get here we basically know the users are all dead. We check if
       // isAssumedSideEffectFree returns true here again because it might not be
       // the case and only the users are dead but the instruction (=call) is
@@ -3022,7 +3032,23 @@ struct AAIsDeadCallSiteReturned : public AAIsDeadFloating {
   /// See AbstractAttribute::updateImpl(...).
   ChangeStatus updateImpl(Attributor &A) override {
     ChangeStatus Changed = ChangeStatus::UNCHANGED;
-    if (IsAssumedSideEffectFree && !isAssumedSideEffectFree(A, getCtxI())) {
+    Instruction *CtxI = getCtxI();
+
+    const IRPosition &IRPFunction =
+        IRPosition::function(*(CtxI->getParent()->getParent()));
+
+    // Check for any mallocs/frees that will be deleted (dead).
+    const auto &HeapToStackAA = A.getAAFor<AAHeapToStack>(
+        *this, IRPFunction, /* TrackDepencence */ false);
+
+    if (HeapToStackAA.isAssumedToBeDeleted(A, CtxI)) {
+      // So isAssumedDead() can actually return true.
+      IsAssumedSideEffectFree = true;
+      A.recordDependence(HeapToStackAA, *this, DepClassTy::OPTIONAL);
+      return Changed;
+    }
+
+    if (IsAssumedSideEffectFree && !isAssumedSideEffectFree(A, CtxI)) {
       IsAssumedSideEffectFree = false;
       Changed = ChangeStatus::CHANGED;
     }
@@ -4877,6 +4903,29 @@ struct AAHeapToStackImpl : public AAHeapToStack {
   DenseMap<Instruction *, SmallPtrSet<Instruction *, 4>> FreesForMalloc;
 
   ChangeStatus updateImpl(Attributor &A) override;
+
+  // Checks if any malloc/frees is marked for deletion.
+  bool isAssumedToBeDeleted(Attributor &A, Instruction *I) const override {
+    if (!getAssumed())
+      return false;
+
+    const auto *TLI = A.getInfoCache().getTargetLibraryInfoForFunction(
+        *(I->getParent()->getParent()));
+
+    bool IsMalloc = isMallocOrCallocLikeFn(I, TLI);
+    if (!IsMalloc && !isFreeCall(I, TLI))
+      return false;
+
+    auto IsI = [I](Instruction *C) { return C == I; };
+    if (IsMalloc)
+      return llvm::any_of(MallocCalls, IsI);
+
+    for (auto &It : FreesForMalloc)
+      if (llvm::any_of(It.second, IsI))
+        return true;
+
+    return false;
+  }
 };
 
 ChangeStatus AAHeapToStackImpl::updateImpl(Attributor &A) {
