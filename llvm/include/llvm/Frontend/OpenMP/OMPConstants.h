@@ -48,6 +48,25 @@ enum class Clause {
 #define OMP_CLAUSE(Enum, ...) constexpr auto Enum = omp::Clause::Enum;
 #include "llvm/Frontend/OpenMP/OMPKinds.def"
 
+/// IDs for all Internal Control Variables (ICVs).
+enum class InternalControlVar {
+#define ICV_DATA_ENV(Enum, ...) Enum,
+#include "llvm/Frontend/OpenMP/OMPKinds.def"
+};
+
+#define ICV_DATA_ENV(Enum, ...)                                                \
+  constexpr auto Enum = omp::InternalControlVar::Enum;
+#include "llvm/Frontend/OpenMP/OMPKinds.def"
+
+enum class ICVInitValue {
+#define ICV_DATA_ENV(Enum, Name, EnvVar, Init) Init,
+#include "llvm/Frontend/OpenMP/OMPKinds.def"
+};
+
+#define ICV_DATA_ENV(Enum, Name, EnvVar, Init)                                 \
+  constexpr auto Init = omp::ICVInitValue::Init;
+#include "llvm/Frontend/OpenMP/OMPKinds.def"
+
 /// IDs for all omp runtime library (RTL) functions.
 enum class RuntimeFunction {
 #define OMP_RTL(Enum, ...) Enum,
