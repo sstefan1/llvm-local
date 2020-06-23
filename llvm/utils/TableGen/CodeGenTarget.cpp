@@ -619,6 +619,7 @@ CodeGenIntrinsic::CodeGenIntrinsic(Record *R) {
   canThrow = false;
   isNoReturn = false;
   isNoSync = false;
+  isNoFree = false;
   isWillReturn = false;
   isCold = false;
   isNoDuplicate = false;
@@ -785,6 +786,8 @@ CodeGenIntrinsic::CodeGenIntrinsic(Record *R) {
       isNoReturn = true;
     else if (Property->getName() == "IntrNoSync")
       isNoSync = true;
+    else if (Property->getName() == "IntrNoFree")
+      isNoFree = true;
     else if (Property->getName() == "IntrWillReturn")
       isWillReturn = true;
     else if (Property->getName() == "IntrCold")

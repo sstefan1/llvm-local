@@ -117,6 +117,8 @@ class ReadNone<AttrIndex idx> : IntrinsicProperty {
 
 def IntrNoReturn : IntrinsicProperty;
 
+def IntrNoFree : IntrinsicProperty;
+
 def IntrWillReturn : IntrinsicProperty;
 
 // IntrCold - Calls to this intrinsic are cold.
@@ -329,12 +331,25 @@ class Intrinsic<list<LLVMType> ret_types,
                 list<LLVMType> param_types = [],
                 list<IntrinsicProperty> intr_properties = [],
                 string name = "",
-                list<SDNodeProperty> sd_properties = []> : SDPatternOperator {
+                list<SDNodeProperty> sd_properties = [],
+                list<IntrinsicProperty> optout_intr_properties = []> : SDPatternOperator {
   string LLVMName = name;
   string TargetPrefix = "";   // Set to a prefix for target-specific intrinsics.
   list<LLVMType> RetTypes = ret_types;
   list<LLVMType> ParamTypes = param_types;
-  list<IntrinsicProperty> IntrProperties = intr_properties;
+  list<IntrinsicProperty> DefaultIntrProperties = [IntrNoSync, IntrNoFree, IntrWillReturn];
+
+  list<IntrinsicProperty> default_properties = !foldl(
+      []<IntrinsicProperty>, DefaultIntrProperties, a, b,
+      !listconcat(
+          a, !if (!size(!foldl(
+                      []<IntrinsicProperty>, optout_intr_properties, c, d,
+                      !listconcat(c,
+                                  !if (!eq(!cast<string>(b), !cast<string>(d)),
+                                       [d], []<IntrinsicProperty>)))),
+                  []<IntrinsicProperty>, [b])));
+
+  list<IntrinsicProperty> IntrProperties = !listconcat(intr_properties, default_properties);
   let Properties = sd_properties;
 
   bit isTarget = 0;
@@ -567,9 +582,9 @@ def int_memmove : Intrinsic<[],
 def int_memset  : Intrinsic<[],
                             [llvm_anyptr_ty, llvm_i8_ty, llvm_anyint_ty,
                              llvm_i1_ty],
-                            [IntrWriteMem, IntrArgMemOnly, IntrWillReturn,
+                            [IntrWriteMem, IntrArgMemOnly,
                              NoCapture<ArgIndex<0>>, WriteOnly<ArgIndex<0>>,
-                             ImmArg<ArgIndex<3>>]>;
+                             ImmArg<ArgIndex<3>>], "", [], [IntrNoSync, IntrNoFree]>;
 
 // FIXME: Add version of these floating point intrinsics which allow non-default
 // rounding modes and FP exception handling.
