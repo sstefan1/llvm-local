@@ -17,7 +17,9 @@ include "llvm/CodeGen/SDNodeProperties.td"
 //  Properties we keep track of for intrinsics.
 //===----------------------------------------------------------------------===//
 
-class IntrinsicProperty;
+class IntrinsicProperty<bit is_default = 0> {
+  bit IsDefault = is_default;
+}
 
 // Intr*Mem - Memory properties.  If no property is set, the worst case
 // is assumed (it may read and write any memory it can get access to and it may
@@ -331,13 +333,15 @@ class Intrinsic<list<LLVMType> ret_types,
                 list<LLVMType> param_types = [],
                 list<IntrinsicProperty> intr_properties = [],
                 string name = "",
-                list<SDNodeProperty> sd_properties = []> : SDPatternOperator {
+                list<SDNodeProperty> sd_properties = [],
+                bit disable_default_attributes = 0> : SDPatternOperator {
   string LLVMName = name;
   string TargetPrefix = "";   // Set to a prefix for target-specific intrinsics.
   list<LLVMType> RetTypes = ret_types;
   list<LLVMType> ParamTypes = param_types;
   list<IntrinsicProperty> IntrProperties = intr_properties;
   let Properties = sd_properties;
+  bit DisableDefaultAttributes = disable_default_attributes;
 
   bit isTarget = 0;
 }
@@ -572,7 +576,7 @@ def int_memset  : Intrinsic<[],
                              llvm_i1_ty],
                             [IntrWriteMem, IntrArgMemOnly, IntrWillReturn,
                              NoCapture<ArgIndex<0>>, WriteOnly<ArgIndex<0>>,
-                             ImmArg<ArgIndex<3>>]>;
+                             ImmArg<ArgIndex<3>>], "", []>;
 
 // FIXME: Add version of these floating point intrinsics which allow non-default
 // rounding modes and FP exception handling.
