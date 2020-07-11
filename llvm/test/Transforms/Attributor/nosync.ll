@@ -399,10 +399,10 @@ declare void @llvm.memset(i8* %dest, i8 %val, i32 %len, i1 %isvolatile)
 ; It is odd to add nocapture but a result of the llvm.memcpy nocapture.
 ;
 define i32 @memcpy_volatile(i8* %ptr1, i8* %ptr2) {
-; CHECK: Function Attrs: argmemonly nounwind willreturn
+; CHECK: Function Attrs: argmemonly nofree nosync nounwind willreturn
 ; CHECK-LABEL: define {{[^@]+}}@memcpy_volatile
-; CHECK-SAME: (i8* nocapture writeonly [[PTR1:%.*]], i8* nocapture readonly [[PTR2:%.*]])
-; CHECK-NEXT:    call void @llvm.memcpy.p0i8.p0i8.i32(i8* noalias nocapture writeonly [[PTR1]], i8* noalias nocapture readonly [[PTR2]], i32 8, i1 true)
+; CHECK-SAME: (i8* nocapture nofree writeonly [[PTR1:%.*]], i8* nocapture nofree readonly [[PTR2:%.*]])
+; CHECK-NEXT:    call void @llvm.memcpy.p0i8.p0i8.i32(i8* noalias nocapture nofree writeonly [[PTR1]], i8* noalias nocapture nofree readonly [[PTR2]], i32 8, i1 true)
 ; CHECK-NEXT:    ret i32 4
 ;
   call void @llvm.memcpy(i8* %ptr1, i8* %ptr2, i32 8, i1 1)
@@ -414,10 +414,10 @@ define i32 @memcpy_volatile(i8* %ptr1, i8* %ptr2) {
 ; It is odd to add nocapture but a result of the llvm.memset nocapture.
 ;
 define i32 @memset_non_volatile(i8* %ptr1, i8 %val) {
-; CHECK: Function Attrs: argmemonly nosync nounwind willreturn writeonly
+; CHECK: Function Attrs: argmemonly nofree nosync nounwind willreturn writeonly
 ; CHECK-LABEL: define {{[^@]+}}@memset_non_volatile
-; CHECK-SAME: (i8* nocapture writeonly [[PTR1:%.*]], i8 [[VAL:%.*]])
-; CHECK-NEXT:    call void @llvm.memset.p0i8.i32(i8* nocapture writeonly [[PTR1]], i8 [[VAL]], i32 8, i1 false)
+; CHECK-SAME: (i8* nocapture nofree writeonly [[PTR1:%.*]], i8 [[VAL:%.*]])
+; CHECK-NEXT:    call void @llvm.memset.p0i8.i32(i8* nocapture nofree writeonly [[PTR1]], i8 [[VAL]], i32 8, i1 false)
 ; CHECK-NEXT:    ret i32 4
 ;
   call void @llvm.memset(i8* %ptr1, i8 %val, i32 8, i1 0)
@@ -449,7 +449,7 @@ define void @convergent_readnone(){
   ret void
 }
 
-; CHECK: Function Attrs: nounwind
+; CHECK: Function Attrs: nofree nosync nounwind willreturn
 ; CHECK-NEXT: declare void @llvm.x86.sse2.clflush(i8*)
 declare void @llvm.x86.sse2.clflush(i8*)
 @a = common global i32 0, align 4
@@ -457,9 +457,9 @@ declare void @llvm.x86.sse2.clflush(i8*)
 ; TEST 18 - negative. Synchronizing intrinsic
 
 define void @i_totally_sync() {
-; CHECK: Function Attrs: nounwind
+; CHECK: Function Attrs: nofree nosync nounwind willreturn
 ; CHECK-LABEL: define {{[^@]+}}@i_totally_sync()
-; CHECK-NEXT:    tail call void @llvm.x86.sse2.clflush(i8* nonnull align 4 dereferenceable(4) bitcast (i32* @a to i8*))
+; CHECK-NEXT:    tail call void @llvm.x86.sse2.clflush(i8* nofree nonnull align 4 dereferenceable(4) bitcast (i32* @a to i8*))
 ; CHECK-NEXT:    ret void
 ;
   tail call void @llvm.x86.sse2.clflush(i8* bitcast (i32* @a to i8*))
@@ -486,7 +486,7 @@ define i32 @cos_test(float %x) {
 }
 
 define float @cos_test2(float %x) {
-; CHECK: Function Attrs: nosync nounwind readnone willreturn
+; CHECK: Function Attrs: nofree nosync nounwind readnone willreturn
 ; CHECK-LABEL: define {{[^@]+}}@cos_test2
 ; CHECK-SAME: (float [[X:%.*]])
 ; CHECK-NEXT:    [[C:%.*]] = call float @llvm.cos.f32(float [[X]])

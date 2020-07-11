@@ -332,7 +332,7 @@ define void @conditional_exit(i32 %0, i32* nocapture readonly %1) local_unnamed_
 
 ; TEST 6 (positive case)
 ; Call intrinsic function
-; CHECK: Function Attrs: nounwind readnone speculatable willreturn
+; CHECK: Function Attrs: nofree nosync nounwind readnone speculatable willreturn
 ; CHECK-NEXT: declare float @llvm.floor.f32(float)
 declare float @llvm.floor.f32(float)
 
@@ -352,7 +352,7 @@ define void @call_floor(float %a) #0 {
 }
 
 define float @call_floor2(float %a) #0 {
-; CHECK: Function Attrs: noinline nosync nounwind readnone uwtable willreturn
+; CHECK: Function Attrs: nofree noinline nosync nounwind readnone uwtable willreturn
 ; CHECK-LABEL: define {{[^@]+}}@call_floor2
 ; CHECK-SAME: (float [[A:%.*]])
 ; CHECK-NEXT:    [[C:%.*]] = tail call float @llvm.floor.f32(float [[A]])
@@ -460,7 +460,7 @@ declare i1 @maybe_raise_exception() #1 willreturn
 
 define void @invoke_test() personality i32 (...)* @__gxx_personality_v0 {
 ; IS__TUNIT____: Function Attrs: nounwind willreturn
-; IS__TUNIT____-LABEL: define {{[^@]+}}@invoke_test() #12 personality i32 (...)* @__gxx_personality_v0
+; IS__TUNIT____-LABEL: define {{[^@]+}}@invoke_test() #11 personality i32 (...)* @__gxx_personality_v0
 ; IS__TUNIT____-NEXT:    [[TMP1:%.*]] = invoke i1 @maybe_raise_exception()
 ; IS__TUNIT____-NEXT:    to label [[N:%.*]] unwind label [[F:%.*]]
 ; IS__TUNIT____:       N:

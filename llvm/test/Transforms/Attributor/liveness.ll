@@ -1979,12 +1979,12 @@ define i32 @h(i32 %i) {
 @p = global i8 0
 
 define void @bad_gep() {
-; CHECK: Function Attrs: nounwind readnone willreturn
+; CHECK: Function Attrs: nofree nosync nounwind readnone willreturn
 ; CHECK-LABEL: define {{[^@]+}}@bad_gep()
 ; CHECK-NEXT:  entry:
 ; CHECK-NEXT:    [[N:%.*]] = alloca i8, align 1
 ; CHECK-NEXT:    [[M:%.*]] = alloca i8, align 1
-; CHECK-NEXT:    call void @llvm.lifetime.start.p0i8(i64 1, i8* noalias nocapture nonnull dereferenceable(1) [[N]])
+; CHECK-NEXT:    call void @llvm.lifetime.start.p0i8(i64 1, i8* noalias nocapture nofree nonnull dereferenceable(1) [[N]])
 ; CHECK-NEXT:    br label [[EXIT:%.*]]
 ; CHECK:       while.body:
 ; CHECK-NEXT:    unreachable
@@ -1993,7 +1993,7 @@ define void @bad_gep() {
 ; CHECK:       if.end:
 ; CHECK-NEXT:    unreachable
 ; CHECK:       exit:
-; CHECK-NEXT:    call void @llvm.lifetime.end.p0i8(i64 1, i8* noalias nocapture nonnull dereferenceable(1) [[N]])
+; CHECK-NEXT:    call void @llvm.lifetime.end.p0i8(i64 1, i8* noalias nocapture nofree nonnull dereferenceable(1) [[N]])
 ; CHECK-NEXT:    ret void
 ;
 entry:

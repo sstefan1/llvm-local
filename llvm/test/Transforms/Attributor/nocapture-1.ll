@@ -577,11 +577,11 @@ entry:
 }
 
 define void @nocaptureLaunder(i8* %p) {
-; CHECK: Function Attrs: nounwind willreturn
+; CHECK: Function Attrs: nofree nosync nounwind willreturn
 ; CHECK-LABEL: define {{[^@]+}}@nocaptureLaunder
-; CHECK-SAME: (i8* nocapture [[P:%.*]])
+; CHECK-SAME: (i8* nocapture nofree [[P:%.*]])
 ; CHECK-NEXT:  entry:
-; CHECK-NEXT:    [[B:%.*]] = call i8* @llvm.launder.invariant.group.p0i8(i8* [[P]])
+; CHECK-NEXT:    [[B:%.*]] = call i8* @llvm.launder.invariant.group.p0i8(i8* nofree [[P]])
 ; CHECK-NEXT:    store i8 42, i8* [[B]], align 1
 ; CHECK-NEXT:    ret void
 ;
@@ -593,10 +593,10 @@ entry:
 
 @g2 = global i8* null
 define void @captureLaunder(i8* %p) {
-; CHECK: Function Attrs: nounwind willreturn
+; CHECK: Function Attrs: nofree nosync nounwind willreturn
 ; CHECK-LABEL: define {{[^@]+}}@captureLaunder
-; CHECK-SAME: (i8* [[P:%.*]])
-; CHECK-NEXT:    [[B:%.*]] = call i8* @llvm.launder.invariant.group.p0i8(i8* [[P]])
+; CHECK-SAME: (i8* nofree [[P:%.*]])
+; CHECK-NEXT:    [[B:%.*]] = call i8* @llvm.launder.invariant.group.p0i8(i8* nofree [[P]])
 ; CHECK-NEXT:    store i8* [[B]], i8** @g2, align 8
 ; CHECK-NEXT:    ret void
 ;
@@ -606,11 +606,11 @@ define void @captureLaunder(i8* %p) {
 }
 
 define void @nocaptureStrip(i8* %p) {
-; CHECK: Function Attrs: nosync nounwind willreturn writeonly
+; CHECK: Function Attrs: nofree nosync nounwind willreturn writeonly
 ; CHECK-LABEL: define {{[^@]+}}@nocaptureStrip
-; CHECK-SAME: (i8* nocapture writeonly [[P:%.*]])
+; CHECK-SAME: (i8* nocapture nofree writeonly [[P:%.*]])
 ; CHECK-NEXT:  entry:
-; CHECK-NEXT:    [[B:%.*]] = call i8* @llvm.strip.invariant.group.p0i8(i8* noalias readnone [[P]])
+; CHECK-NEXT:    [[B:%.*]] = call i8* @llvm.strip.invariant.group.p0i8(i8* noalias nofree readnone [[P]])
 ; CHECK-NEXT:    store i8 42, i8* [[B]], align 1
 ; CHECK-NEXT:    ret void
 ;
@@ -622,10 +622,10 @@ entry:
 
 @g3 = global i8* null
 define void @captureStrip(i8* %p) {
-; CHECK: Function Attrs: nosync nounwind willreturn writeonly
+; CHECK: Function Attrs: nofree nosync nounwind willreturn writeonly
 ; CHECK-LABEL: define {{[^@]+}}@captureStrip
-; CHECK-SAME: (i8* writeonly [[P:%.*]])
-; CHECK-NEXT:    [[B:%.*]] = call i8* @llvm.strip.invariant.group.p0i8(i8* noalias readnone [[P]])
+; CHECK-SAME: (i8* nofree writeonly [[P:%.*]])
+; CHECK-NEXT:    [[B:%.*]] = call i8* @llvm.strip.invariant.group.p0i8(i8* noalias nofree readnone [[P]])
 ; CHECK-NEXT:    store i8* [[B]], i8** @g3, align 8
 ; CHECK-NEXT:    ret void
 ;

@@ -69,10 +69,10 @@ define i32 @extern() {
 declare i32 @k() readnone
 
 define void @intrinsic(i8* %dest, i8* %src, i32 %len) {
-; CHECK: Function Attrs: argmemonly nosync nounwind willreturn
+; CHECK: Function Attrs: argmemonly nofree nosync nounwind willreturn
 ; CHECK-LABEL: define {{[^@]+}}@intrinsic
-; CHECK-SAME: (i8* nocapture writeonly [[DEST:%.*]], i8* nocapture readonly [[SRC:%.*]], i32 [[LEN:%.*]])
-; CHECK-NEXT:    call void @llvm.memcpy.p0i8.p0i8.i32(i8* noalias nocapture writeonly [[DEST]], i8* noalias nocapture readonly [[SRC]], i32 [[LEN]], i1 false)
+; CHECK-SAME: (i8* nocapture nofree writeonly [[DEST:%.*]], i8* nocapture nofree readonly [[SRC:%.*]], i32 [[LEN:%.*]])
+; CHECK-NEXT:    call void @llvm.memcpy.p0i8.p0i8.i32(i8* noalias nocapture nofree writeonly [[DEST]], i8* noalias nocapture nofree readonly [[SRC]], i32 [[LEN]], i1 false)
 ; CHECK-NEXT:    ret void
 ;
   call void @llvm.memcpy.p0i8.p0i8.i32(i8* %dest, i8* %src, i32 %len, i1 false)

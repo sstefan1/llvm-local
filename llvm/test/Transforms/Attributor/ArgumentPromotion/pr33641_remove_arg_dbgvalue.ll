@@ -32,11 +32,17 @@ define void @foo() {
 }
 
 define internal void @bar(%p_t %p)  {
-; CHECK: Function Attrs: nosync nounwind readnone willreturn
-; CHECK-LABEL: define {{[^@]+}}@bar
-; CHECK-SAME: (i16* nocapture nofree readnone [[P:%.*]])
-; CHECK-NEXT:    call void @llvm.dbg.value(metadata i16* [[P]], metadata !3, metadata !DIExpression()) #3, !dbg !5
-; CHECK-NEXT:    ret void
+; IS__TUNIT____: Function Attrs: nofree nosync nounwind readnone willreturn
+; IS__TUNIT____-LABEL: define {{[^@]+}}@bar
+; IS__TUNIT____-SAME: (i16* nocapture nofree readnone [[P:%.*]])
+; IS__TUNIT____-NEXT:    call void @llvm.dbg.value(metadata i16* [[P]], metadata !3, metadata !DIExpression()) #2, !dbg !5
+; IS__TUNIT____-NEXT:    ret void
+;
+; IS__CGSCC____: Function Attrs: nofree nosync nounwind readnone willreturn
+; IS__CGSCC____-LABEL: define {{[^@]+}}@bar
+; IS__CGSCC____-SAME: (i16* nocapture nofree readnone [[P:%.*]])
+; IS__CGSCC____-NEXT:    call void @llvm.dbg.value(metadata i16* [[P]], metadata !3, metadata !DIExpression()) #3, !dbg !5
+; IS__CGSCC____-NEXT:    ret void
 ;
   call void @llvm.dbg.value(metadata %p_t %p, metadata !4, metadata !5), !dbg !6
   ret void

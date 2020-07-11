@@ -163,7 +163,7 @@ declare void @llvm.masked.scatter.v4i32.v4p0i32(<4 x i32>%val, <4 x i32*>, i32, 
 ; CHECK-NOT: readnone
 ; CHECK-NOT: readonly
 define void @test9(<4 x i32*> %ptrs, <4 x i32>%val) {
-; CHECK: Function Attrs: nounwind willreturn
+; CHECK: Function Attrs: nofree nosync nounwind willreturn
 ; CHECK-LABEL: define {{[^@]+}}@test9
 ; CHECK-SAME: (<4 x i32*> [[PTRS:%.*]], <4 x i32> [[VAL:%.*]])
 ; CHECK-NEXT:    call void @llvm.masked.scatter.v4i32.v4p0i32(<4 x i32> [[VAL]], <4 x i32*> [[PTRS]], i32 4, <4 x i1> <i1 true, i1 false, i1 true, i1 false>)
@@ -176,7 +176,7 @@ define void @test9(<4 x i32*> %ptrs, <4 x i32>%val) {
 ; CHECK: declare <4 x i32> @llvm.masked.gather
 declare <4 x i32> @llvm.masked.gather.v4i32.v4p0i32(<4 x i32*>, i32, <4 x i1>, <4 x i32>)
 define <4 x i32> @test10(<4 x i32*> %ptrs) {
-; CHECK: Function Attrs: nounwind readonly willreturn
+; CHECK: Function Attrs: nofree nosync nounwind readonly willreturn
 ; CHECK-LABEL: define {{[^@]+}}@test10
 ; CHECK-SAME: (<4 x i32*> [[PTRS:%.*]])
 ; CHECK-NEXT:    [[RES:%.*]] = call <4 x i32> @llvm.masked.gather.v4i32.v4p0i32(<4 x i32*> [[PTRS]], i32 4, <4 x i1> <i1 true, i1 false, i1 true, i1 false>, <4 x i32> undef)
