@@ -30,8 +30,8 @@ class IntrinsicProperty<bit is_default = 0> {
 def IntrNoMem : IntrinsicProperty;
 
 // IntrNoSync - Threads executing the intrinsic will not synchronize using
-// memory or other means.
-def IntrNoSync : IntrinsicProperty;
+// memory or other means. Applied by default.
+def IntrNoSync : IntrinsicProperty<1>;
 
 // IntrReadMem - This intrinsic only reads from memory. It does not write to
 // memory and has no other side effects. Therefore, it cannot be moved across
@@ -119,9 +119,11 @@ class ReadNone<AttrIndex idx> : IntrinsicProperty {
 
 def IntrNoReturn : IntrinsicProperty;
 
-def IntrNoFree : IntrinsicProperty;
+// Applied by default.
+def IntrNoFree : IntrinsicProperty<1>;
 
-def IntrWillReturn : IntrinsicProperty;
+// Applied by default.
+def IntrWillReturn : IntrinsicProperty<1>;
 
 // IntrCold - Calls to this intrinsic are cold.
 // Parallels the cold attribute on LLVM IR functions.
@@ -924,7 +926,7 @@ let IntrProperties = [IntrNoMem] in {
 }
 def int_eh_sjlj_functioncontext : Intrinsic<[], [llvm_ptr_ty]>;
 def int_eh_sjlj_setjmp          : Intrinsic<[llvm_i32_ty], [llvm_ptr_ty]>;
-def int_eh_sjlj_longjmp         : Intrinsic<[], [llvm_ptr_ty], [IntrNoReturn]>;
+def int_eh_sjlj_longjmp         : Intrinsic<[], [llvm_ptr_ty], [IntrNoReturn], "", [], 1>;
 def int_eh_sjlj_setup_dispatch  : Intrinsic<[], []>;
 
 //===---------------- Generic Variable Attribute Intrinsics----------------===//
