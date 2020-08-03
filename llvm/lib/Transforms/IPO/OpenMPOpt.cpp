@@ -1170,6 +1170,14 @@ struct AAICVTracker : public StateWrapper<BooleanState, AbstractAttribute> {
   virtual Value *getReplacementValue(InternalControlVar ICV,
                                      const Instruction *I, Attributor &A) = 0;
 
+  /// Check if any value was tracked.
+  virtual bool hasTrackedValue(InternalControlVar &ICV) const { return false; }
+
+  /// Check if any call potentially changes the ICV.
+  virtual bool hasUnknownCall(InternalControlVar &ICV, Attributor &A) const {
+    return false;
+  }
+
   /// See AbstractAttribute::getName()
   const std::string getName() const override { return "AAICVTracker"; }
 
@@ -1216,7 +1224,7 @@ struct AAICVTrackerFunction : public AAICVTracker {
     auto ReplaceAndDeleteCB = [&](Use &U, Function &Caller) {
       CallInst *CI = OpenMPOpt::getCallIfRegularCall(U, &GetterRFI);
       Instruction *UserI = cast<Instruction>(U.getUser());
-      Value *ReplVal = getReplacementValue(ICV, UserI, A);
+      Value *ReplVal = ICVReplacementValuesMap[ICV][UserI];
 
       if (!ReplVal || !CI)
         return false;
@@ -1237,6 +1245,23 @@ struct AAICVTrackerFunction : public AAICVTracker {
                   InternalControlVar::ICV___last>
       ICVValuesMap;
 
+  // Map of ICV to their values at specific program point.
+  EnumeratedArray<DenseMap<Instruction *, Value *>, InternalControlVar,
+                  InternalControlVar::ICV___last>
+      ICVReplacementValuesMap;
+
+  bool hasTrackedValue(InternalControlVar &ICV) const override {
+    return !ICVValuesMap[ICV].empty();
+  }
+
+  bool hasUnknownCall(InternalControlVar &ICV, Attributor &A) const override {
+    for (BasicBlock &BB : *getAnchorScope())
+      for (Instruction &I : BB)
+        if (callChangesICV(A, &I, ICV))
+          return true;
+    return false;
+  }
+
   // Currently only nthreads is being tracked.
   // this array will only grow with time.
   InternalControlVar TrackableICVs[1] = {ICV_nthreads};
@@ -1250,6 +1275,7 @@ struct AAICVTrackerFunction : public AAICVTracker {
 
     for (InternalControlVar ICV : TrackableICVs) {
       auto &SetterRFI = OMPInfoCache.RFIs[OMPInfoCache.ICVs[ICV].Setter];
+      auto &GetterRFI = OMPInfoCache.RFIs[OMPInfoCache.ICVs[ICV].Getter];
 
       auto TrackValues = [&](Use &U, Function &) {
         CallInst *CI = OpenMPOpt::getCallIfRegularCall(U);
@@ -1264,20 +1290,72 @@ struct AAICVTrackerFunction : public AAICVTracker {
         return false;
       };
 
+      // Map replacement values to Getters and their uses.
+      auto MapReplacementValues = [&](Use &U, Function &) {
+        CallInst *CI = OpenMPOpt::getCallIfRegularCall(U);
+        if (!CI)
+          return false;
+
+        Value *ReplVal = getReplacementValue(ICV, CI, A);
+        if (ICVReplacementValuesMap[ICV]
+                .insert(std::make_pair(CI, ReplVal))
+                .second)
+          HasChanged = ChangeStatus::CHANGED;
+
+        assert((!ICVReplacementValuesMap[ICV].lookup(CI) ||
+                ICVReplacementValuesMap[ICV].lookup(CI) == ReplVal) &&
+               "Getter should be either not mapped or mapped to ReplVal");
+
+        return false;
+      };
+
       SetterRFI.foreachUse(TrackValues, F);
+      GetterRFI.foreachUse(MapReplacementValues, F);
     }
 
     return HasChanged;
   }
 
+  /// Check if \p I is a call and whether it changes the ICV.
+  bool callChangesICV(Attributor &A, const Instruction *I,
+                      InternalControlVar &ICV) const {
+    const auto *CB = dyn_cast<CallBase>(I);
+    if (!CB)
+      return false;
+
+    auto &OMPInfoCache = static_cast<OMPInformationCache &>(A.getInfoCache());
+    auto &GetterRFI = OMPInfoCache.RFIs[OMPInfoCache.ICVs[ICV].Getter];
+    auto &SetterRFI = OMPInfoCache.RFIs[OMPInfoCache.ICVs[ICV].Setter];
+    Function *CalledFunction = CB->getCalledFunction();
+
+    if (CalledFunction == GetterRFI.Declaration)
+      return false;
+    if (CalledFunction == SetterRFI.Declaration)
+      return true;
+
+    // Since we don't know, assume it changes the ICV.
+    if (CalledFunction->isDeclaration())
+      return true;
+
+    const auto &ICVTrackingAA =
+        A.getAAFor<AAICVTracker>(*this, IRPosition::function(*CalledFunction));
+
+    if (ICVTrackingAA.isAssumedTracked())
+      return !ICVTrackingAA.hasTrackedValue(ICV) &&
+             ICVTrackingAA.hasUnknownCall(ICV, A);
+
+    return true;
+  }
+
   /// Return the value with which \p I can be replaced for specific \p ICV.
   Value *getReplacementValue(InternalControlVar ICV, const Instruction *I,
                              Attributor &A) override {
+    if (ICVReplacementValuesMap[ICV].count(I))
+      return ICVReplacementValuesMap[ICV].lookup(I);
+
     const BasicBlock *CurrBB = I->getParent();
 
     auto &ValuesSet = ICVValuesMap[ICV];
-    auto &OMPInfoCache = static_cast<OMPInformationCache &>(A.getInfoCache());
-    auto &GetterRFI = OMPInfoCache.RFIs[OMPInfoCache.ICVs[ICV].Getter];
 
     for (const auto &ICVVal : ValuesSet) {
       if (CurrBB == ICVVal.Inst->getParent()) {
@@ -1286,18 +1364,42 @@ struct AAICVTrackerFunction : public AAICVTracker {
 
         // both instructions are in the same BB and at \p I we know the ICV
         // value.
-        while (I != ICVVal.Inst) {
+        const Instruction *CurrInst = I;
+        while (CurrInst != ICVVal.Inst) {
           // we don't yet know if a call might update an ICV.
           // TODO: check callsite AA for value.
-          if (const auto *CB = dyn_cast<CallBase>(I))
-            if (CB->getCalledFunction() != GetterRFI.Declaration)
-              return nullptr;
+          if (callChangesICV(A, CurrInst, ICV))
+            return nullptr;
 
-          I = I->getPrevNode();
+          CurrInst = CurrInst->getPrevNode();
         }
 
         // No call in between, return the value.
         return ICVVal.TrackedValue;
+      }
+
+      auto &OMPInfoCache = static_cast<OMPInformationCache &>(A.getInfoCache());
+      auto &Explorer = OMPInfoCache.getMustBeExecutedContextExplorer();
+      for (const BasicBlock *Pred : predecessors(CurrBB)) {
+        if (ICVVal.Inst->getParent() == Pred) {
+          if (!Explorer.findInContextOf(ICVVal.Inst, I))
+            return nullptr;
+          Instruction *CurrInst = ICVVal.Inst->getNextNode();
+          while (CurrInst != Pred->getTerminator()) {
+            // If any of the calls after the tracked value, might change the
+            // ICV, we don't know the value.
+            if (callChangesICV(A, CurrInst, ICV))
+              return nullptr;
+            CurrInst = CurrInst->getNextNode();
+          }
+          return ICVVal.TrackedValue;
+        }
+
+        // if any of the calls in a block that doesn't have tracked value might
+        // change the ICV, we don't know the value.
+        for (const Instruction &Inst : *Pred)
+          if (callChangesICV(A, &Inst, ICV))
+            return nullptr;
       }
     }
 
@@ -1373,7 +1475,9 @@ PreservedAnalyses OpenMPOptPass::run(LazyCallGraph::SCC &C,
   OMPInformationCache InfoCache(*(Functions.back()->getParent()), AG, Allocator,
                                 /*CGSCC*/ Functions, OMPInModule.getKernels());
 
-  Attributor A(Functions, InfoCache, CGUpdater);
+  SetVector<Function *> ModuleSlice(InfoCache.ModuleSlice.begin(),
+                                    InfoCache.ModuleSlice.end());
+  Attributor A(ModuleSlice, InfoCache, CGUpdater);
 
   // TODO: Compute the module slice we are allowed to look at.
   OpenMPOpt OMPOpt(SCC, CGUpdater, OREGetter, InfoCache, A);
@@ -1450,7 +1554,9 @@ struct OpenMPOptLegacyPass : public CallGraphSCCPass {
         *(Functions.back()->getParent()), AG, Allocator,
         /*CGSCC*/ Functions, OMPInModule.getKernels());
 
-    Attributor A(Functions, InfoCache, CGUpdater);
+    SetVector<Function *> ModuleSlice(InfoCache.ModuleSlice.begin(),
+                                      InfoCache.ModuleSlice.end());
+    Attributor A(ModuleSlice, InfoCache, CGUpdater);
 
     // TODO: Compute the module slice we are allowed to look at.
     OpenMPOpt OMPOpt(SCC, CGUpdater, OREGetter, InfoCache, A);

@@ -7,6 +7,29 @@
 @.str = private unnamed_addr constant [23 x i8] c";unknown;unknown;0;0;;\00", align 1
 @0 = private unnamed_addr global %struct.ident_t { i32 0, i32 2, i32 0, i32 0, i8* getelementptr inbounds ([23 x i8], [23 x i8]* @.str, i32 0, i32 0) }, align 8
 
+; doesn't modify any ICVs.
+define i32 @icv_free_use(i32 %0) {
+; CHECK-LABEL: define {{[^@]+}}@icv_free_use
+; CHECK-SAME: (i32 [[TMP0:%.*]])
+; CHECK-NEXT:    [[TMP2:%.*]] = add nsw i32 [[TMP0]], 1
+; CHECK-NEXT:    ret i32 [[TMP2]]
+;
+  %2 = add nsw i32 %0, 1
+  ret i32 %2
+}
+
+define i32 @bad_use(i32 %0) {
+; CHECK-LABEL: define {{[^@]+}}@bad_use
+; CHECK-SAME: (i32 [[TMP0:%.*]])
+; CHECK-NEXT:    tail call void @use(i32 [[TMP0]])
+; CHECK-NEXT:    [[TMP2:%.*]] = add nsw i32 [[TMP0]], 1
+; CHECK-NEXT:    ret i32 [[TMP2]]
+;
+  tail call void @use(i32 %0)
+  %2 = add nsw i32 %0, 1
+  ret i32 %2
+}
+
 define dso_local i32 @foo(i32 %0, i32 %1) {
 ; CHECK-LABEL: define {{[^@]+}}@foo
 ; CHECK-SAME: (i32 [[TMP0:%.*]], i32 [[TMP1:%.*]])
@@ -102,6 +125,155 @@ define internal void @.omp_outlined..1(i32* %0, i32*  %1) {
   tail call void @use(i32 %4)
   %5 = tail call i32 @omp_get_max_threads()
   tail call void @use(i32 %5)
+  ret void
+}
+
+define dso_local i32 @bar1(i32 %0, i32 %1) {
+; CHECK-LABEL: define {{[^@]+}}@bar1
+; CHECK-SAME: (i32 [[TMP0:%.*]], i32 [[TMP1:%.*]])
+; CHECK-NEXT:    [[TMP3:%.*]] = icmp sgt i32 [[TMP0]], [[TMP1]]
+; CHECK-NEXT:    [[TMP4:%.*]] = select i1 [[TMP3]], i32 [[TMP0]], i32 [[TMP1]]
+; CHECK-NEXT:    tail call void @omp_set_num_threads(i32 [[TMP4]])
+; CHECK-NEXT:    tail call void (%struct.ident_t*, i32, void (i32*, i32*, ...)*, ...) @__kmpc_fork_call(%struct.ident_t* nonnull @0, i32 0, void (i32*, i32*, ...)* bitcast (void (i32*, i32*)* @.omp_outlined..2 to void (i32*, i32*, ...)*))
+; CHECK-NEXT:    [[TMP5:%.*]] = tail call i32 @omp_get_max_threads()
+; CHECK-NEXT:    tail call void @use(i32 [[TMP5]])
+; CHECK-NEXT:    ret i32 0
+;
+  %3 = icmp sgt i32 %0, %1
+  %4 = select i1 %3, i32 %0, i32 %1
+  tail call void @omp_set_num_threads(i32 %4)
+  %5 = tail call i32 @omp_get_max_threads()
+  tail call void (%struct.ident_t*, i32, void (i32*, i32*, ...)*, ...) @__kmpc_fork_call(%struct.ident_t* nonnull @0, i32 0, void (i32*, i32*, ...)* bitcast (void (i32*, i32*)* @.omp_outlined..2 to void (i32*, i32*, ...)*))
+  %6 = tail call i32 @omp_get_max_threads()
+  tail call void @use(i32 %6)
+  ret i32 0
+}
+
+define internal void @.omp_outlined..2(i32* %0, i32*  %1) {
+; CHECK-LABEL: define {{[^@]+}}@.omp_outlined..2
+; CHECK-SAME: (i32* [[TMP0:%.*]], i32* [[TMP1:%.*]])
+; CHECK-NEXT:    [[TMP3:%.*]] = tail call i32 @omp_get_max_threads()
+; CHECK-NEXT:    [[TMP4:%.*]] = tail call i32 @icv_free_use(i32 [[TMP3]])
+; CHECK-NEXT:    tail call void @omp_set_num_threads(i32 10)
+; CHECK-NEXT:    [[TMP5:%.*]] = tail call i32 @icv_free_use(i32 10)
+; CHECK-NEXT:    [[TMP6:%.*]] = tail call i32 @icv_free_use(i32 10)
+; CHECK-NEXT:    ret void
+;
+  %3 = tail call i32 @omp_get_max_threads()
+  %4 = tail call i32 @icv_free_use(i32 %3)
+  tail call void @omp_set_num_threads(i32 10)
+  %5 = tail call i32 @omp_get_max_threads()
+  %6 = tail call i32 @icv_free_use(i32 %5)
+  %7 = tail call i32 @omp_get_max_threads()
+  %8 = tail call i32 @icv_free_use(i32 %7)
+  ret void
+}
+define void @test(i1 %0) {
+; CHECK-LABEL: define {{[^@]+}}@test
+; CHECK-SAME: (i1 [[TMP0:%.*]])
+; CHECK-NEXT:    call void @omp_set_num_threads(i32 2)
+; CHECK-NEXT:    [[TMP2:%.*]] = icmp eq i1 [[TMP0]], false
+; CHECK-NEXT:    br i1 [[TMP2]], label [[TMP4:%.*]], label [[TMP3:%.*]]
+; CHECK:       3:
+; CHECK-NEXT:    call void @use(i32 10)
+; CHECK-NEXT:    br label [[TMP4]]
+; CHECK:       4:
+; CHECK-NEXT:    [[TMP5:%.*]] = call i32 @omp_get_max_threads()
+; CHECK-NEXT:    call void @use(i32 [[TMP5]])
+; CHECK-NEXT:    ret void
+;
+  call void @omp_set_num_threads(i32 2)
+  %2 = icmp eq i1 %0, 0
+  br i1 %2, label %4, label %3
+
+3:                                                ; preds = %1
+  call void @use(i32 10)
+  br label %4
+
+4:                                                ; preds = %3, %1
+  %5 = call i32 @omp_get_max_threads()
+  call void @use(i32 %5)
+  ret void
+}
+
+define void @test1(i1 %0) {
+; CHECK-LABEL: define {{[^@]+}}@test1
+; CHECK-SAME: (i1 [[TMP0:%.*]])
+; CHECK-NEXT:    call void @omp_set_num_threads(i32 2)
+; CHECK-NEXT:    [[TMP2:%.*]] = icmp eq i1 [[TMP0]], false
+; CHECK-NEXT:    br i1 [[TMP2]], label [[TMP5:%.*]], label [[TMP3:%.*]]
+; CHECK:       3:
+; CHECK-NEXT:    [[TMP4:%.*]] = call i32 @icv_free_use(i32 10)
+; CHECK-NEXT:    br label [[TMP5]]
+; CHECK:       5:
+; CHECK-NEXT:    call void @use(i32 2)
+; CHECK-NEXT:    ret void
+;
+  call void @omp_set_num_threads(i32 2)
+  %2 = icmp eq i1 %0, 0
+  br i1 %2, label %5, label %3
+
+3:                                                ; preds = %1
+  %4 = call i32 @icv_free_use(i32 10)
+  br label %5
+
+5:                                                ; preds = %3, %1
+  %6 = call i32 @omp_get_max_threads()
+  call void @use(i32 %6)
+  ret void
+}
+
+define void @bad_use_test(i1 %0) {
+; CHECK-LABEL: define {{[^@]+}}@bad_use_test
+; CHECK-SAME: (i1 [[TMP0:%.*]])
+; CHECK-NEXT:    call void @omp_set_num_threads(i32 2)
+; CHECK-NEXT:    [[TMP2:%.*]] = icmp eq i1 [[TMP0]], false
+; CHECK-NEXT:    br i1 [[TMP2]], label [[TMP5:%.*]], label [[TMP3:%.*]]
+; CHECK:       3:
+; CHECK-NEXT:    [[TMP4:%.*]] = call i32 @bad_use(i32 10)
+; CHECK-NEXT:    br label [[TMP5]]
+; CHECK:       5:
+; CHECK-NEXT:    [[TMP6:%.*]] = call i32 @omp_get_max_threads()
+; CHECK-NEXT:    call void @use(i32 [[TMP6]])
+; CHECK-NEXT:    ret void
+;
+  call void @omp_set_num_threads(i32 2)
+  %2 = icmp eq i1 %0, 0
+  br i1 %2, label %5, label %3
+
+3:                                                ; preds = %1
+  %4 = call i32 @bad_use(i32 10)
+  br label %5
+
+5:                                                ; preds = %3, %1
+  %6 = call i32 @omp_get_max_threads()
+  call void @use(i32 %6)
+  ret void
+}
+
+define void @test2(i1 %0) {
+; CHECK-LABEL: define {{[^@]+}}@test2
+; CHECK-SAME: (i1 [[TMP0:%.*]])
+; CHECK-NEXT:    [[TMP2:%.*]] = icmp eq i1 [[TMP0]], false
+; CHECK-NEXT:    br i1 [[TMP2]], label [[TMP4:%.*]], label [[TMP3:%.*]]
+; CHECK:       3:
+; CHECK-NEXT:    call void @omp_set_num_threads(i32 4)
+; CHECK-NEXT:    br label [[TMP4]]
+; CHECK:       4:
+; CHECK-NEXT:    [[TMP5:%.*]] = call i32 @omp_get_max_threads()
+; CHECK-NEXT:    call void @use(i32 [[TMP5]])
+; CHECK-NEXT:    ret void
+;
+  %2 = icmp eq i1 %0, 0
+  br i1 %2, label %4, label %3
+
+3:                                                ; preds = %1
+  call void @omp_set_num_threads(i32 4)
+  br label %4
+
+4:                                                ; preds = %3, %1
+  %5 = call i32 @omp_get_max_threads()
+  call void @use(i32 %5)
   ret void
 }
 
