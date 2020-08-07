@@ -82,43 +82,6 @@ static void foreachUse(Function &F, CBTy CB,
   }
 }
 
-/// Helper struct to store tracked ICV values at specif instructions.
-struct ICVValue {
-  Instruction *Inst;
-  Value *TrackedValue;
-
-  ICVValue(Instruction *I, Value *Val) : Inst(I), TrackedValue(Val) {}
-};
-
-namespace llvm {
-
-// Provide DenseMapInfo for ICVValue
-template <> struct DenseMapInfo<ICVValue> {
-  using InstInfo = DenseMapInfo<Instruction *>;
-  using ValueInfo = DenseMapInfo<Value *>;
-
-  static inline ICVValue getEmptyKey() {
-    return ICVValue(InstInfo::getEmptyKey(), ValueInfo::getEmptyKey());
-  };
-
-  static inline ICVValue getTombstoneKey() {
-    return ICVValue(InstInfo::getTombstoneKey(), ValueInfo::getTombstoneKey());
-  };
-
-  static unsigned getHashValue(const ICVValue &ICVVal) {
-    return detail::combineHashValue(
-        InstInfo::getHashValue(ICVVal.Inst),
-        ValueInfo::getHashValue(ICVVal.TrackedValue));
-  }
-
-  static bool isEqual(const ICVValue &LHS, const ICVValue &RHS) {
-    return InstInfo::isEqual(LHS.Inst, RHS.Inst) &&
-           ValueInfo::isEqual(LHS.TrackedValue, RHS.TrackedValue);
-  }
-};
-
-} // end namespace llvm
-
 namespace {
 
 struct AAICVTracker;
@@ -935,7 +898,7 @@ private:
 
   /// Helper function to run Attributor on SCC.
   bool runAttributor() {
-    if (SCC.empty())
+    if (OMPInfoCache.ModuleSlice.empty())
       return false;
 
     registerAAs();
@@ -951,11 +914,44 @@ private:
   /// Populate the Attributor with abstract attribute opportunities in the
   /// function.
   void registerAAs() {
-    for (Function *F : SCC) {
+    for (Function *F : OMPInfoCache.ModuleSlice) {
       if (F->isDeclaration())
         continue;
 
       A.getOrCreateAAFor<AAICVTracker>(IRPosition::function(*F));
+
+      A.getOrCreateAAFor<AAICVTracker>(IRPosition::returned(*F));
+
+      // auto CallSitePred = [&](Instruction &I) -> bool {
+      // auto &CB = cast<CallBase>(I);
+
+      // Function *Callee = CB.getCalledFunction();
+      // if (!Callee)
+      // return true;
+
+      // IRPosition CBRetPos = IRPosition::callsite_returned(CB);
+
+      // A.getOrCreateAAFor<AAICVTracker>(CBRetPos);
+      // };
+
+      auto &OpcodeInstMap = OMPInfoCache.getOpcodeInstMapForFunction(*F);
+      auto *Insts = OpcodeInstMap.lookup(Instruction::Call);
+      if (!Insts)
+        continue;
+      for (Instruction *I : *Insts) {
+        auto &CB = cast<CallBase>(*I);
+
+        Function *Callee = CB.getCalledFunction();
+        if (!Callee || Callee->isDeclaration())
+          continue;
+
+        IRPosition CBRetPos = IRPosition::callsite_returned(CB);
+        A.getOrCreateAAFor<AAICVTracker>(CBRetPos);
+      }
+      // Attributor::checkForAllInstructionsImpl(nullptr, OpcodeInstMap,
+      // CallSitePred, nullptr,
+      // nullptr {Instruction::Call},
+      // [> CheckBBLivenessOnly <] true);
     }
   }
 };
@@ -1157,6 +1153,12 @@ struct AAICVTracker : public StateWrapper<BooleanState, AbstractAttribute> {
   using Base = StateWrapper<BooleanState, AbstractAttribute>;
   AAICVTracker(const IRPosition &IRP, Attributor &A) : Base(IRP) {}
 
+  void initialize(Attributor &A) override {
+    Function *F = getAnchorScope();
+    if (!F || !A.isFunctionIPOAmendable(*F))
+      indicatePessimisticFixpoint();
+  }
+
   /// Returns true if value is assumed to be tracked.
   bool isAssumedTracked() const { return getAssumed(); }
 
@@ -1167,24 +1169,38 @@ struct AAICVTracker : public StateWrapper<BooleanState, AbstractAttribute> {
   static AAICVTracker &createForPosition(const IRPosition &IRP, Attributor &A);
 
   /// Return the value with which \p I can be replaced for specific \p ICV.
-  virtual Value *getReplacementValue(InternalControlVar ICV,
-                                     const Instruction *I, Attributor &A) = 0;
+  virtual Optional<Value *> getReplacementValue(InternalControlVar ICV,
+                                                const Instruction *I,
+                                                Attributor &A) const {
+    return None;
+  }
+
+  /// Return an assumed unique ICV value if a single candidate is found. If
+  /// there cannot be one, return a nullptr. If it is not clear yet, return the
+  /// Optional::NoneType.
+  virtual Optional<Value *>
+  getUniqueReplacementValue(InternalControlVar ICV) const = 0;
+
+  /// Compute the unique ICV value, if possible, after the function is called.
+  // virtual Optional<Value *> getUniqueValue(InternalControlVar ICV,
+  // Attributor &A) const = 0;
 
   /// Check if any value was tracked.
   virtual bool hasTrackedValue(InternalControlVar &ICV) const { return false; }
 
-  /// Check if any call potentially changes the ICV.
-  virtual bool hasUnknownCall(InternalControlVar &ICV, Attributor &A) const {
-    return false;
-  }
+  // Currently only nthreads is being tracked.
+  // this array will only grow with time.
+  InternalControlVar TrackableICVs[1] = {ICV_nthreads};
 
   /// See AbstractAttribute::getName()
-  const std::string getName() const override { return "AAICVTracker"; }
+  const std::string getName() const override { return getAsStr(); }
+  // const std::string getName() const override { return "AAICVTracker"; }
 
   /// See AbstractAttribute::getIdAddr()
   const char *getIdAddr() const override { return &ID; }
 
-  /// This function should return true if the type of the \p AA is AAICVTracker
+  /// This function should return true if the type of the \p AA is
+  /// AAICVTracker
   static bool classof(const AbstractAttribute *AA) {
     return (AA->getIdAddr() == &ID);
   }
@@ -1197,7 +1213,7 @@ struct AAICVTrackerFunction : public AAICVTracker {
       : AAICVTracker(IRP, A) {}
 
   // FIXME: come up with better string.
-  const std::string getAsStr() const override { return "ICVTracker"; }
+  const std::string getAsStr() const override { return "ICVTrackerFunction"; }
 
   // FIXME: come up with some stats.
   void trackStatistics() const override {}
@@ -1241,30 +1257,13 @@ struct AAICVTrackerFunction : public AAICVTracker {
   }
 
   // Map of ICV to their values at specific program point.
-  EnumeratedArray<SmallSetVector<ICVValue, 4>, InternalControlVar,
-                  InternalControlVar::ICV___last>
-      ICVValuesMap;
-
-  // Map of ICV to their values at specific program point.
   EnumeratedArray<DenseMap<Instruction *, Value *>, InternalControlVar,
                   InternalControlVar::ICV___last>
       ICVReplacementValuesMap;
 
   bool hasTrackedValue(InternalControlVar &ICV) const override {
-    return !ICVValuesMap[ICV].empty();
+    return !ICVReplacementValuesMap[ICV].empty();
   }
-
-  bool hasUnknownCall(InternalControlVar &ICV, Attributor &A) const override {
-    for (BasicBlock &BB : *getAnchorScope())
-      for (Instruction &I : BB)
-        if (callChangesICV(A, &I, ICV))
-          return true;
-    return false;
-  }
-
-  // Currently only nthreads is being tracked.
-  // this array will only grow with time.
-  InternalControlVar TrackableICVs[1] = {ICV_nthreads};
 
   ChangeStatus updateImpl(Attributor &A) override {
     ChangeStatus HasChanged = ChangeStatus::UNCHANGED;
@@ -1284,7 +1283,9 @@ struct AAICVTrackerFunction : public AAICVTracker {
 
         // FIXME: handle setters with more that 1 arguments.
         /// Track new value.
-        if (ICVValuesMap[ICV].insert(ICVValue(CI, CI->getArgOperand(0))))
+        if (ICVReplacementValuesMap[ICV]
+                .insert(std::make_pair(CI, CI->getArgOperand(0)))
+                .second)
           HasChanged = ChangeStatus::CHANGED;
 
         return false;
@@ -1296,11 +1297,13 @@ struct AAICVTrackerFunction : public AAICVTracker {
         if (!CI)
           return false;
 
-        Value *ReplVal = getReplacementValue(ICV, CI, A);
-        if (ICVReplacementValuesMap[ICV]
-                .insert(std::make_pair(CI, ReplVal))
-                .second)
+        Optional<Value *> ReplVal = getReplacementValue(ICV, CI, A);
+        if (ReplVal.hasValue() &&
+            ICVReplacementValuesMap[ICV]
+                .insert(std::make_pair(CI, ReplVal.getValue()))
+                .second) {
           HasChanged = ChangeStatus::CHANGED;
+        }
 
         assert((!ICVReplacementValuesMap[ICV].lookup(CI) ||
                 ICVReplacementValuesMap[ICV].lookup(CI) == ReplVal) &&
@@ -1309,11 +1312,64 @@ struct AAICVTrackerFunction : public AAICVTracker {
         return false;
       };
 
+      // auto CheckReturnInst = [&](Instruction &I) {
+      // Optional<Value *> ReplVal = getReplacementValue(ICV, &I, A);
+      // if (ReplVal.hasValue() &&
+      // ICVReplacementValuesMap[ICV]
+      // .insert(std::make_pair(&I, ReplVal.getValue()))
+      // .second)
+      // HasChanged = ChangeStatus::CHANGED;
+
+      // return true;
+      // };
+
+      // Track all changes of an ICV.
       SetterRFI.foreachUse(TrackValues, F);
+      // Map all getters to a value if possible.
       GetterRFI.foreachUse(MapReplacementValues, F);
+      // Get ICV value at every return instruction. If all return instruction
+      // have the same value, that is the ICV value after this function call.
+      // A.checkForAllInstructions(CheckReturnInst, *this, {Instruction::Ret},
+      // [> CheckBBLivenessOnly <] true);
     }
 
     return HasChanged;
+  }
+
+  /// Check if \p I is a call and whether it changes the ICV.
+  Optional<Value *> getValueForCall(Attributor &A, const Instruction *I,
+                                    InternalControlVar &ICV) const {
+    const auto *CB = dyn_cast<CallBase>(I);
+    if (!CB)
+      return None;
+
+    auto &OMPInfoCache = static_cast<OMPInformationCache &>(A.getInfoCache());
+    auto &GetterRFI = OMPInfoCache.RFIs[OMPInfoCache.ICVs[ICV].Getter];
+    auto &SetterRFI = OMPInfoCache.RFIs[OMPInfoCache.ICVs[ICV].Setter];
+    Function *CalledFunction = CB->getCalledFunction();
+
+    if (CalledFunction == GetterRFI.Declaration)
+      return None;
+    if (CalledFunction == SetterRFI.Declaration) {
+      if (ICVReplacementValuesMap[ICV].count(I))
+        return ICVReplacementValuesMap[ICV].lookup(I);
+
+      return nullptr;
+    }
+
+    // Since we don't know, assume it changes the ICV.
+    if (CalledFunction->isDeclaration())
+      return nullptr;
+
+    const auto &ICVTrackingAA =
+        A.getAAFor<AAICVTracker>(*this, IRPosition::callsite_returned(*CB));
+
+    if (ICVTrackingAA.isAssumedTracked())
+      return ICVTrackingAA.getUniqueReplacementValue(ICV);
+          // return ICVTrackingAA.hasTrackedValue(ICV);
+
+    // If we don't know, assume it changes.
+    return nullptr;
   }
 
   /// Check if \p I is a call and whether it changes the ICV.
@@ -1341,70 +1397,277 @@ struct AAICVTrackerFunction : public AAICVTracker {
         A.getAAFor<AAICVTracker>(*this, IRPosition::function(*CalledFunction));
 
     if (ICVTrackingAA.isAssumedTracked())
-      return !ICVTrackingAA.hasTrackedValue(ICV) &&
-             ICVTrackingAA.hasUnknownCall(ICV, A);
+      return ICVTrackingAA.hasTrackedValue(ICV);
 
     return true;
   }
 
+  // We don't check unique value for a function, so return None.
+  Optional<Value *>
+  getUniqueReplacementValue(InternalControlVar ICV) const override {
+    return None;
+  }
+
+  // Optional<Value *> getUniqueReplacementValue(InternalControlVar ICV,
+  // const Instruction *I,
+  // Attributor &A) const override {
+  // const auto &CB = cast<CallBase>(*I);
+  // Function *CalledFunction = CB.getCalledFunction();
+
+  // if (CalledFunction->isDeclaration())
+  // return nullptr;
+
+  // const auto &ICVTrackingAA =
+  // A.getAAFor<AAICVTracker>(*this, IRPosition::function(*CalledFunction));
+
+  // if (ICVTrackingAA.isAssumedTracked())
+  // return ICVTrackingAA.getUniqueValue(ICV, A);
+
+  // return nullptr;
+  // }
+
+  // Optional<Value *> getUniqueValue(InternalControlVar ICV,
+  // Attributor &A) const override {
+  // Optional<Value *> UniqueICVValue;
+  // auto CheckReturnInst = [&](Instruction &I) {
+  // Optional<Value *> ReplVal = getReplacementValue(ICV, &I, A);
+
+  // // If we found a second ICV value there is no unique returned value.
+  // if (UniqueICVValue.hasValue() && UniqueICVValue != ReplVal) {
+  // UniqueICVValue = nullptr;
+  // return false;
+  // }
+
+  // UniqueICVValue = ReplVal;
+
+  // return true;
+  // };
+
+  // if (!A.checkForAllInstructions(CheckReturnInst, *this, {Instruction::Ret},
+  // [> CheckBBLivenessOnly <] true))
+  // UniqueICVValue = nullptr;
+
+  // return UniqueICVValue;
+  // }
+
   /// Return the value with which \p I can be replaced for specific \p ICV.
-  Value *getReplacementValue(InternalControlVar ICV, const Instruction *I,
-                             Attributor &A) override {
-    if (ICVReplacementValuesMap[ICV].count(I))
-      return ICVReplacementValuesMap[ICV].lookup(I);
+  Optional<Value *> getReplacementValue(InternalControlVar ICV,
+                                        const Instruction *I,
+                                        Attributor &A) const override {
+    const auto &ValuesMap = ICVReplacementValuesMap[ICV];
+    if (ValuesMap.count(I))
+      return ValuesMap.lookup(I);
 
-    const BasicBlock *CurrBB = I->getParent();
+    SmallVector<const Instruction *, 16> Worklist;
+    SmallPtrSet<const Instruction *, 16> Visited;
+    Worklist.push_back(I);
 
-    auto &ValuesSet = ICVValuesMap[ICV];
+    Optional<Value *> ReplVal;
 
-    for (const auto &ICVVal : ValuesSet) {
-      if (CurrBB == ICVVal.Inst->getParent()) {
-        if (!ICVVal.Inst->comesBefore(I))
-          continue;
+    while (!Worklist.empty()) {
+      const Instruction *CurrInst = Worklist.pop_back_val();
+      if (!Visited.insert(CurrInst).second)
+        continue;
 
-        // both instructions are in the same BB and at \p I we know the ICV
-        // value.
-        const Instruction *CurrInst = I;
-        while (CurrInst != ICVVal.Inst) {
-          // we don't yet know if a call might update an ICV.
-          // TODO: check callsite AA for value.
-          if (callChangesICV(A, CurrInst, ICV))
-            return nullptr;
+      const BasicBlock *CurrBB = CurrInst->getParent();
 
-          CurrInst = CurrInst->getPrevNode();
-        }
-
-        // No call in between, return the value.
-        return ICVVal.TrackedValue;
-      }
-
-      auto &OMPInfoCache = static_cast<OMPInformationCache &>(A.getInfoCache());
-      auto &Explorer = OMPInfoCache.getMustBeExecutedContextExplorer();
-      for (const BasicBlock *Pred : predecessors(CurrBB)) {
-        if (ICVVal.Inst->getParent() == Pred) {
-          if (!Explorer.findInContextOf(ICVVal.Inst, I))
-            return nullptr;
-          Instruction *CurrInst = ICVVal.Inst->getNextNode();
-          while (CurrInst != Pred->getTerminator()) {
-            // If any of the calls after the tracked value, might change the
-            // ICV, we don't know the value.
-            if (callChangesICV(A, CurrInst, ICV))
-              return nullptr;
-            CurrInst = CurrInst->getNextNode();
+      // Go up and look for all potential setters/calls that might change the
+      // ICV.
+      while ((CurrInst = CurrInst->getPrevNode())) {
+        if (ValuesMap.count(CurrInst)) {
+          Optional<Value *> NewReplVal = ValuesMap.lookup(CurrInst);
+          // Unknown value, track new.
+          if (!ReplVal.hasValue()) {
+            ReplVal = NewReplVal;
+            break;
           }
-          return ICVVal.TrackedValue;
+
+          // If we found a new value, we can't know the icv value anymore.
+          if (NewReplVal.hasValue())
+            if (ReplVal != NewReplVal)
+              return nullptr;
+
+          break;
         }
 
-        // if any of the calls in a block that doesn't have tracked value might
-        // change the ICV, we don't know the value.
-        for (const Instruction &Inst : *Pred)
-          if (callChangesICV(A, &Inst, ICV))
-            return nullptr;
+        Optional<Value *> NewReplVal = getValueForCall(A, CurrInst, ICV);
+        if (!NewReplVal.hasValue())
+          continue;
+        // if (!callChangesICV(A, CurrInst, ICV))
+        // continue;
+
+        // Optional<Value *> NewReplVal =
+        // getUniqueReplacementValue(ICV, CurrInst, A);
+
+        // Unknown value, track new.
+        if (!ReplVal.hasValue()) {
+          ReplVal = NewReplVal;
+          break;
+        }
+
+        // We found a new value, we can't know the icv value anymore.
+        // if (NewReplVal.hasValue())
+        if (ReplVal != NewReplVal)
+          return nullptr;
       }
+
+      // If we are in the same BB and we have a value, we are done.
+      if (CurrBB == I->getParent() && ReplVal.hasValue())
+        return ReplVal;
+
+      // If we are in the Entry BB and we don't have a value, we are done.
+      if (CurrBB == &(CurrBB->getParent()->getEntryBlock()))
+        if (!ReplVal.hasValue() && hasTrackedValue(ICV))
+          ReplVal = nullptr;
+
+      // Go through all predecessors and add terminators for analysis.
+      for (const BasicBlock *Pred : predecessors(CurrBB))
+        if (const Instruction *Terminator = Pred->getTerminator())
+          Worklist.push_back(Terminator);
     }
 
-    // No value was tracked.
-    return nullptr;
+    // Couldn't find a replacement value, ICV value unknown.
+    if (!ReplVal.hasValue())
+      return None;
+
+    return ReplVal.getValue();
+  }
+};
+
+struct AAICVTrackerFunctionReturned : AAICVTracker {
+  AAICVTrackerFunctionReturned(const IRPosition &IRP, Attributor &A)
+      : AAICVTracker(IRP, A) {}
+
+  // FIXME: come up with better string.
+  const std::string getAsStr() const override {
+    return "ICVTrackerFunctionReturned";
+  }
+
+  // FIXME: come up with some stats.
+  void trackStatistics() const override {}
+
+  /// We don't manifest anything for this AA.
+  ChangeStatus manifest(Attributor &A) override {
+    return ChangeStatus::UNCHANGED;
+  }
+
+  // Map of ICV to their values at specific program point.
+  EnumeratedArray<Optional<Value *>, InternalControlVar,
+                  InternalControlVar::ICV___last>
+      ICVReplacementValuesMap;
+
+  /// Return the value with which \p I can be replaced for specific \p ICV.
+  Optional<Value *>
+  getUniqueReplacementValue(InternalControlVar ICV) const override {
+    // const Instruction *I,
+    // Attributor &A) const override {
+    return ICVReplacementValuesMap[ICV];
+  }
+
+  ChangeStatus updateImpl(Attributor &A) override {
+    ChangeStatus Changed = ChangeStatus::UNCHANGED;
+    const auto &ICVTrackingAA = A.getAAFor<AAICVTracker>(
+        *this, IRPosition::function(*getAnchorScope()));
+
+    if (!ICVTrackingAA.isAssumedTracked())
+      return indicatePessimisticFixpoint();
+    // return UniqueICVValue;
+
+    LLVM_DEBUG(dbgs() << "-------ASSUMED TRACKED------\n");
+    for (InternalControlVar ICV : TrackableICVs) {
+      // TODO: FIXME: Check if reference is ok here.
+      Optional<Value *> &ReplVal = ICVReplacementValuesMap[ICV];
+      Optional<Value *> UniqueICVValue;
+      auto CheckReturnInst = [&](Instruction &I) {
+        Optional<Value *> NewReplVal =
+            ICVTrackingAA.getReplacementValue(ICV, &I, A);
+
+        // If we found a second ICV value there is no unique returned value.
+        if (UniqueICVValue.hasValue() && UniqueICVValue != NewReplVal) {
+          UniqueICVValue = nullptr;
+          return false;
+        }
+
+        UniqueICVValue = NewReplVal;
+
+        return true;
+      };
+
+      if (!A.checkForAllInstructions(CheckReturnInst, *this, {Instruction::Ret},
+                                     /* CheckBBLivenessOnly */ true))
+        UniqueICVValue = nullptr;
+
+      if (UniqueICVValue == ReplVal) {
+        Changed = ChangeStatus::UNCHANGED;
+        continue;
+      }
+
+      ReplVal = UniqueICVValue;
+      Changed = ChangeStatus::CHANGED;
+    }
+
+    return Changed;
+    // return UniqueICVValue;
+  }
+};
+
+struct AAICVTrackerCallSiteReturned : AAICVTracker {
+  AAICVTrackerCallSiteReturned(const IRPosition &IRP, Attributor &A)
+      : AAICVTracker(IRP, A) {}
+
+  // FIXME: come up with better string.
+  const std::string getAsStr() const override {
+    return "ICVTrackerCallSiteReturned";
+  }
+
+  // FIXME: come up with some stats.
+  void trackStatistics() const override {}
+
+  /// We don't manifest anything for this AA.
+  ChangeStatus manifest(Attributor &A) override {
+    return ChangeStatus::UNCHANGED;
+  }
+
+  // Map of ICV to their values at specific program point.
+  EnumeratedArray<Optional<Value *>, InternalControlVar,
+                  InternalControlVar::ICV___last>
+      ICVReplacementValuesMap;
+
+  /// Return the value with which \p I can be replaced for specific \p ICV.
+  Optional<Value *>
+  getUniqueReplacementValue(InternalControlVar ICV) const override {
+    // const Instruction *I,
+    // Attributor &A) const override {
+    return ICVReplacementValuesMap[ICV];
+  }
+
+  ChangeStatus updateImpl(Attributor &A) override {
+    ChangeStatus Changed = ChangeStatus::UNCHANGED;
+    const auto &ICVTrackingAA = A.getAAFor<AAICVTracker>(
+        *this, IRPosition::returned(*getAssociatedFunction()));
+
+    LLVM_DEBUG(dbgs() << "-------ASSOCIATED FN------"
+                      << getAssociatedFunction()->getName() << "\n");
+    // We don't have any information, so we assume it changes the ICV.
+    if (!ICVTrackingAA.isAssumedTracked())
+      return indicatePessimisticFixpoint();
+
+    for (InternalControlVar ICV : TrackableICVs) {
+      // TODO: FIXME: Check if reference is ok here.
+      Optional<Value *> &ReplVal = ICVReplacementValuesMap[ICV];
+      // TODO: FIXME: decide on arguments;
+      Optional<Value *> NewReplVal =
+          ICVTrackingAA.getUniqueReplacementValue(ICV);
+
+      if (ReplVal == NewReplVal) {
+        Changed = ChangeStatus::UNCHANGED;
+        continue;
+      }
+
+      ReplVal = NewReplVal;
+      Changed = ChangeStatus::CHANGED;
+    }
+    return Changed;
   }
 };
 } // namespace
@@ -1418,13 +1681,17 @@ AAICVTracker &AAICVTracker::createForPosition(const IRPosition &IRP,
   case IRPosition::IRP_INVALID:
   case IRPosition::IRP_FLOAT:
   case IRPosition::IRP_ARGUMENT:
-  case IRPosition::IRP_RETURNED:
-  case IRPosition::IRP_CALL_SITE_RETURNED:
   case IRPosition::IRP_CALL_SITE_ARGUMENT:
   case IRPosition::IRP_CALL_SITE:
     llvm_unreachable("ICVTracker can only be created for function position!");
   case IRPosition::IRP_FUNCTION:
     AA = new (A.Allocator) AAICVTrackerFunction(IRP, A);
+    break;
+  case IRPosition::IRP_RETURNED:
+    AA = new (A.Allocator) AAICVTrackerFunctionReturned(IRP, A);
+    break;
+  case IRPosition::IRP_CALL_SITE_RETURNED:
+    AA = new (A.Allocator) AAICVTrackerCallSiteReturned(IRP, A);
     break;
   }
 
