@@ -1491,6 +1491,54 @@ struct Attributor {
   bool checkForAllReadWriteInstructions(function_ref<bool(Instruction &)> Pred,
                                         AbstractAttribute &QueryingAA);
 
+  static void createShallowWrapper(Function &F) {
+    assert(!F.isDeclaration() &&
+           "Cannot create a wrapper around a declaration!");
+
+    Module &M = *F.getParent();
+    LLVMContext &Ctx = M.getContext();
+    FunctionType *FnTy = F.getFunctionType();
+
+    Function *Wrapper = Function::Create(FnTy, F.getLinkage(),
+                                         F.getAddressSpace(), F.getName());
+    F.setName(""); // set the inside function anonymous
+    M.getFunctionList().insert(F.getIterator(), Wrapper);
+
+    F.setLinkage(GlobalValue::InternalLinkage);
+
+    F.replaceAllUsesWith(Wrapper);
+    assert(F.use_empty() && "Uses remained after wrapper was created!");
+
+    // Move the COMDAT section to the wrapper.
+    // TODO: Check if we need to keep it for F as well.
+    Wrapper->setComdat(F.getComdat());
+    F.setComdat(nullptr);
+
+    // Copy all metadata and attributes but keep them on F as well.
+    SmallVector<std::pair<unsigned, MDNode *>, 1> MDs;
+    F.getAllMetadata(MDs);
+    for (auto MDIt : MDs)
+      Wrapper->addMetadata(MDIt.first, *MDIt.second);
+    Wrapper->setAttributes(F.getAttributes());
+
+    // Create the call in the wrapper.
+    BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", Wrapper);
+
+    SmallVector<Value *, 8> Args;
+    auto FArgIt = F.arg_begin();
+    for (Argument &Arg : Wrapper->args()) {
+      Args.push_back(&Arg);
+      Arg.setName((FArgIt++)->getName());
+    }
+
+    CallInst *CI = CallInst::Create(&F, Args, "", EntryBB);
+    CI->setTailCall(true);
+    CI->addAttribute(AttributeList::FunctionIndex, Attribute::NoInline);
+    ReturnInst::Create(Ctx, CI->getType()->isVoidTy() ? nullptr : CI, EntryBB);
+
+    // NumFnShallowWrapperCreated++;
+  }
+
   /// Return the data layout associated with the anchor scope.
   const DataLayout &getDataLayout() const { return InfoCache.DL; }
 

@@ -1329,6 +1329,7 @@ ChangeStatus Attributor::run() {
   TimeTraceScope TimeScope("Attributor::run");
 
   Phase = AttributorPhase::UPDATE;
+  LLVM_DEBUG(dbgs() << "PHASE::UPDATE\n");
   runTillFixpoint();
 
   // dump graphs on demand
@@ -1342,9 +1343,11 @@ ChangeStatus Attributor::run() {
     DG.print();
 
   Phase = AttributorPhase::MANIFEST;
+  LLVM_DEBUG(dbgs() << "PHASE::MANIFEST\n");
   ChangeStatus ManifestChange = manifestAttributes();
 
   Phase = AttributorPhase::CLEANUP;
+  LLVM_DEBUG(dbgs() << "PHASE::CLEANUP\n");
   ChangeStatus CleanupChange = cleanupIR();
 
   return ManifestChange | CleanupChange;
@@ -1396,54 +1399,55 @@ ChangeStatus Attributor::updateAA(AbstractAttribute &AA) {
 ///     return F(arg0, ..., argN);
 ///   }
 ///
-static void createShallowWrapper(Function &F) {
-  assert(AllowShallowWrappers &&
-         "Cannot create a wrapper if it is not allowed!");
-  assert(!F.isDeclaration() && "Cannot create a wrapper around a declaration!");
+// static void createShallowWrapper(Function &F) {
+// // assert(AllowShallowWrappers &&
+// // "Cannot create a wrapper if it is not allowed!");
+// assert(!F.isDeclaration() && "Cannot create a wrapper around a
+// declaration!");
 
-  Module &M = *F.getParent();
-  LLVMContext &Ctx = M.getContext();
-  FunctionType *FnTy = F.getFunctionType();
+// Module &M = *F.getParent();
+// LLVMContext &Ctx = M.getContext();
+// FunctionType *FnTy = F.getFunctionType();
 
-  Function *Wrapper =
-      Function::Create(FnTy, F.getLinkage(), F.getAddressSpace(), F.getName());
-  F.setName(""); // set the inside function anonymous
-  M.getFunctionList().insert(F.getIterator(), Wrapper);
+// Function *Wrapper =
+// Function::Create(FnTy, F.getLinkage(), F.getAddressSpace(), F.getName());
+// F.setName(""); // set the inside function anonymous
+// M.getFunctionList().insert(F.getIterator(), Wrapper);
 
-  F.setLinkage(GlobalValue::InternalLinkage);
+// F.setLinkage(GlobalValue::InternalLinkage);
 
-  F.replaceAllUsesWith(Wrapper);
-  assert(F.use_empty() && "Uses remained after wrapper was created!");
+// F.replaceAllUsesWith(Wrapper);
+// assert(F.use_empty() && "Uses remained after wrapper was created!");
 
-  // Move the COMDAT section to the wrapper.
-  // TODO: Check if we need to keep it for F as well.
-  Wrapper->setComdat(F.getComdat());
-  F.setComdat(nullptr);
+// // Move the COMDAT section to the wrapper.
+// // TODO: Check if we need to keep it for F as well.
+// Wrapper->setComdat(F.getComdat());
+// F.setComdat(nullptr);
 
-  // Copy all metadata and attributes but keep them on F as well.
-  SmallVector<std::pair<unsigned, MDNode *>, 1> MDs;
-  F.getAllMetadata(MDs);
-  for (auto MDIt : MDs)
-    Wrapper->addMetadata(MDIt.first, *MDIt.second);
-  Wrapper->setAttributes(F.getAttributes());
+// // Copy all metadata and attributes but keep them on F as well.
+// SmallVector<std::pair<unsigned, MDNode *>, 1> MDs;
+// F.getAllMetadata(MDs);
+// for (auto MDIt : MDs)
+// Wrapper->addMetadata(MDIt.first, *MDIt.second);
+// Wrapper->setAttributes(F.getAttributes());
 
-  // Create the call in the wrapper.
-  BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", Wrapper);
+// // Create the call in the wrapper.
+// BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", Wrapper);
 
-  SmallVector<Value *, 8> Args;
-  auto FArgIt = F.arg_begin();
-  for (Argument &Arg : Wrapper->args()) {
-    Args.push_back(&Arg);
-    Arg.setName((FArgIt++)->getName());
-  }
+// SmallVector<Value *, 8> Args;
+// auto FArgIt = F.arg_begin();
+// for (Argument &Arg : Wrapper->args()) {
+// Args.push_back(&Arg);
+// Arg.setName((FArgIt++)->getName());
+// }
 
-  CallInst *CI = CallInst::Create(&F, Args, "", EntryBB);
-  CI->setTailCall(true);
-  CI->addAttribute(AttributeList::FunctionIndex, Attribute::NoInline);
-  ReturnInst::Create(Ctx, CI->getType()->isVoidTy() ? nullptr : CI, EntryBB);
+// CallInst *CI = CallInst::Create(&F, Args, "", EntryBB);
+// CI->setTailCall(true);
+// CI->addAttribute(AttributeList::FunctionIndex, Attribute::NoInline);
+// ReturnInst::Create(Ctx, CI->getType()->isVoidTy() ? nullptr : CI, EntryBB);
 
-  NumFnShallowWrapperCreated++;
-}
+// NumFnShallowWrapperCreated++;
+// }
 
 /// Make another copy of the function \p F such that the copied version has
 /// internal linkage afterwards and can be analysed. Then we replace all uses
@@ -2241,7 +2245,7 @@ static bool runAttributorOnFunctions(InformationCache &InfoCache,
   if (AllowShallowWrappers)
     for (Function *F : Functions)
       if (!A.isFunctionIPOAmendable(*F))
-        createShallowWrapper(*F);
+        Attributor::createShallowWrapper(*F);
 
   // Internalize non-exact functions
   // TODO: for now we eagerly internalize functions without calculating the

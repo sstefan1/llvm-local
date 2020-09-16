@@ -105,6 +105,13 @@ struct OMPInformationCache : public InformationCache {
     /// Setter RTL function associated with this ICV.
     RuntimeFunction Setter;
 
+    /// Which argument of the setter defines the value.
+    int SetterArgNo;
+
+    /// Kind to describe how this ICV is impacted by calls, e.g., if the value
+    /// can change or not by an unknown call.
+    ICVInterferenceKind InterferenceKind;
+
     /// Getter RTL function associated with this ICV.
     RuntimeFunction Getter;
 
@@ -221,10 +228,12 @@ struct OMPInformationCache : public InformationCache {
   /// Helper to initialize all internal control variable information for those
   /// defined in OMPKinds.def.
   void initializeInternalControlVars() {
-#define ICV_RT_SET(_Name, RTL)                                                 \
+#define ICV_RT_SET(_Name, RTL, ARGUMENT_NO, INTERFERENCE_KIND)                 \
   {                                                                            \
     auto &ICV = ICVs[_Name];                                                   \
     ICV.Setter = RTL;                                                          \
+    ICV.SetterArgNo = ARGUMENT_NO;                                             \
+    ICV.InterferenceKind = INTERFERENCE_KIND;                                  \
   }
 #define ICV_RT_GET(Name, RTL)                                                  \
   {                                                                            \
@@ -400,6 +409,8 @@ struct OpenMPOpt {
     LLVM_DEBUG(dbgs() << TAG << "Run on SCC with " << SCC.size()
                       << " functions in a slice with "
                       << OMPInfoCache.ModuleSlice.size() << " functions\n");
+    for (auto *F : OMPInfoCache.ModuleSlice)
+      LLVM_DEBUG(dbgs() << F->getName() << "\n");
 
     if (PrintICVValues)
       printICVs();
@@ -1176,8 +1187,13 @@ struct AAICVTracker : public StateWrapper<BooleanState, AbstractAttribute> {
 
   void initialize(Attributor &A) override {
     Function *F = getAnchorScope();
-    if (!F || !A.isFunctionIPOAmendable(*F))
+    LLVM_DEBUG(dbgs() << "Function INITIALIZE-------- " << F->getName()
+                      << "\n");
+    if (!F || !A.isFunctionIPOAmendable(*F)) {
+      LLVM_DEBUG(dbgs() << "Function PESSIMISTIC-------- " << F->getName()
+                        << "\n");
       indicatePessimisticFixpoint();
+    }
   }
 
   /// Returns true if value is assumed to be tracked.
@@ -1204,7 +1220,7 @@ struct AAICVTracker : public StateWrapper<BooleanState, AbstractAttribute> {
 
   // Currently only nthreads is being tracked.
   // this array will only grow with time.
-  InternalControlVar TrackableICVs[1] = {ICV_nthreads};
+  InternalControlVar TrackableICVs[2] = {ICV_nthreads, ICV_GPU_SPMD};
 
   /// See AbstractAttribute::getName()
   const std::string getName() const override { return "AAICVTracker"; }
@@ -1244,11 +1260,13 @@ struct AAICVTrackerFunction : public AAICVTracker {
     ChangeStatus HasChanged = ChangeStatus::UNCHANGED;
 
     Function *F = getAnchorScope();
+    LLVM_DEBUG(dbgs() << "Function UPDATE-------- " << F->getName() << "\n");
 
     auto &OMPInfoCache = static_cast<OMPInformationCache &>(A.getInfoCache());
 
     for (InternalControlVar ICV : TrackableICVs) {
-      auto &SetterRFI = OMPInfoCache.RFIs[OMPInfoCache.ICVs[ICV].Setter];
+      auto &ICVInfo = OMPInfoCache.ICVs[ICV];
+      auto &SetterRFI = OMPInfoCache.RFIs[ICVInfo.Setter];
 
       auto &ValuesMap = ICVReplacementValuesMap[ICV];
       auto TrackValues = [&](Use &U, Function &) {
@@ -1256,10 +1274,18 @@ struct AAICVTrackerFunction : public AAICVTracker {
         if (!CI)
           return false;
 
-        // FIXME: handle setters with more that 1 arguments.
-        /// Track new value.
-        if (ValuesMap.insert(std::make_pair(CI, CI->getArgOperand(0))).second)
+        // Track new value.
+        Value *ICVIRValue;
+        if (ICVInfo.SetterArgNo >= 0)
+          ICVIRValue = CI->getArgOperand(ICVInfo.SetterArgNo);
+        else
+          ICVIRValue = ConstantInt::get(Type::getInt8Ty(CI->getContext()), 1);
+
+        if (ValuesMap.insert(std::make_pair(CI, ICVIRValue)).second) {
+          LLVM_DEBUG(dbgs()
+                     << "----------  " << *CI << "  ------CHANGED SETTER\n");
           HasChanged = ChangeStatus::CHANGED;
+        }
 
         return false;
       };
@@ -1273,11 +1299,61 @@ struct AAICVTrackerFunction : public AAICVTracker {
         return true;
       };
 
+      auto CallSiteCheck = [&](AbstractCallSite ACS) {
+        // Function *F = ACS.getCalledFunction();
+        CallBase *CB = ACS.getInstruction();
+        // Function *F = CB->getParent()->getParent();
+        Function *F = CB->getCaller();
+        if (!F)
+          return false;
+        LLVM_DEBUG(dbgs() << "Function CallSite-------- " << F->getName()
+                          << "\n");
+
+        const auto &ICVTrackingAA =
+            A.getAAFor<AAICVTracker>(*this, IRPosition::function(*F));
+
+        if (ICVTrackingAA.isAssumedTracked())
+          return true;
+
+        LLVM_DEBUG(dbgs() << "ASSUMED--------\n");
+
+        // auto str =
+        // A.isInModuleSlice(*F) ? "IN SLICE----\n" : "NOT IN SLICE-----\n";
+        // LLVM_DEBUG(dbgs() << str);
+
+        Optional<Value *> ReplVal =
+            ICVTrackingAA.getReplacementValue(ICV, ACS.getInstruction(), A);
+
+        if (!ReplVal.hasValue())
+          return true;
+        if (ReplVal)
+          LLVM_DEBUG(dbgs() << "REPLVAL:--------" << *ReplVal << "\n");
+        Function *Callee = ACS.getCalledFunction();
+        Instruction *CallerEntry = &Callee->getEntryBlock().front();
+        if (ValuesMap.insert(std::make_pair(CallerEntry, *ReplVal)).second) {
+          HasChanged = ChangeStatus::CHANGED;
+          return true;
+        }
+
+        LLVM_DEBUG(dbgs() << "CHECK1--------\n");
+        if (ValuesMap.lookup(CallerEntry) != *ReplVal)
+          return false;
+        // if (ReplVal.hasValue())
+        // return false;
+
+        LLVM_DEBUG(dbgs() << "CHECK2--------\n");
+        // ReplVal = NewReplVal;
+        return true;
+        };
+
       // Track all changes of an ICV.
       SetterRFI.foreachUse(TrackValues, F);
 
       A.checkForAllInstructions(CallCheck, *this, {Instruction::Call},
                                 /* CheckBBLivenessOnly */ true);
+
+      bool AllCallSitesKnown;
+      A.checkForAllCallSites(CallSiteCheck, *this, true, AllCallSitesKnown);
 
       /// TODO: Figure out a way to avoid adding entry in
       /// ICVReplacementValuesMap
@@ -1299,8 +1375,11 @@ struct AAICVTrackerFunction : public AAICVTracker {
       return None;
 
     auto &OMPInfoCache = static_cast<OMPInformationCache &>(A.getInfoCache());
-    auto &GetterRFI = OMPInfoCache.RFIs[OMPInfoCache.ICVs[ICV].Getter];
-    auto &SetterRFI = OMPInfoCache.RFIs[OMPInfoCache.ICVs[ICV].Setter];
+    auto &ICVInfo = OMPInfoCache.ICVs[ICV];
+
+
+    auto &GetterRFI = OMPInfoCache.RFIs[ICVInfo.Getter];
+    auto &SetterRFI = OMPInfoCache.RFIs[ICVInfo.Setter];
     Function *CalledFunction = CB->getCalledFunction();
 
     if (CalledFunction == GetterRFI.Declaration)
@@ -1311,6 +1390,9 @@ struct AAICVTrackerFunction : public AAICVTracker {
 
       return nullptr;
     }
+    // If nothing can change
+    if (ICVInfo.InterferenceKind == ICV_INTERFERENCE_KIND_nothing)
+      return None;
 
     // Since we don't know, assume it changes the ICV.
     if (CalledFunction->isDeclaration())
@@ -1337,6 +1419,9 @@ struct AAICVTrackerFunction : public AAICVTracker {
                                         const Instruction *I,
                                         Attributor &A) const override {
     const auto &ValuesMap = ICVReplacementValuesMap[ICV];
+    // auto &OMPInfoCache = static_cast<OMPInformationCache
+    // &>(A.getInfoCache()); auto &ICVInfo = OMPInfoCache.ICVs[ICV];
+
     if (ValuesMap.count(I))
       return ValuesMap.lookup(I);
 
@@ -1667,6 +1752,10 @@ PreservedAnalyses OpenMPOptPass::run(LazyCallGraph::SCC &C,
                                 /*CGSCC*/ Functions, OMPInModule.getKernels());
 
   Attributor A(Functions, InfoCache, CGUpdater);
+
+  for (Function *F : InfoCache.ModuleSlice)
+    if (!A.isFunctionIPOAmendable(*F) && !F->isDeclaration())
+      Attributor::createShallowWrapper(*F);
 
   OpenMPOpt OMPOpt(SCC, CGUpdater, OREGetter, InfoCache, A);
   bool Changed = OMPOpt.run();
